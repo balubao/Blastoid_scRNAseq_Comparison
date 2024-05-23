@@ -47,3 +47,24 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Outputs
+*.log
+*.pdf
+*.png
+*.svg
+*.jpeg
+*.tiff
+
+*.[Rr]da
+*.[Rr][Dd][Ss]
+*.h5ad
+*.h5[Ss]eurat
+*.loom
+
+*.zip
+*.tar
+
+*.bam
+*.bam.bai
+*.gz
