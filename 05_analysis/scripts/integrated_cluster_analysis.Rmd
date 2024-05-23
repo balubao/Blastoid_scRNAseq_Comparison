@@ -1,0 +1,1027 @@
+---
+title: "integrated_data_analysis"
+author: "Ali Balubaid"
+date: "2024-03-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# set-up
+setwd("/home/balubao/Documents/Research/blastoid_comparison/")
+source("script/Initiation.R")
+```
+
+# Analyze Integrated Data
+
+```{r load data}
+cca_int_obj <- readRDS("cca_integrated_blastoid.rds")
+cca_ref_int_obj <- readRDS("cca_refpxy_integrated_blastoid.rds")
+rpca_int_obj <- readRDS("rpca_kw80_integrated_blastoid.rds")
+rpca_ref_int_obj <- readRDS("rpca_refpxy_kw80_integrated_blastoid.rds")
+mnn_int_obj <- readRDS("mnn_integrated_blastoid.rds")
+harmony_int_obj <- readRDS("harmony_integrated_blastoid.rds")
+
+load("preintegrated_seurat_obj.rda")
+
+split_obj@reductions[["integrated.cca"]] <- cca_int_obj@reductions$integrated.cca
+split_obj@reductions[["integrated.cca_ref"]] <- cca_ref_int_obj@reductions$integrated.cca
+split_obj@reductions[["integrated.rpca"]] <- rpca_int_obj@reductions$integrated.rpca
+split_obj@reductions[["integrated.rpca_ref"]] <- rpca_ref_int_obj@reductions$integrated.rpca
+split_obj@reductions[["integrated.mnn"]] <- mnn_int_obj@reductions$integrated.mnn
+split_obj@reductions[["integrated.harmony"]] <- harmony_int_obj@reductions$integrated.harmony
+```
+
+```{r}
+# modify for adjusted celltype labels
+seurat.list <- readRDS("03_annotation/results/annotated_seurat_list_revision_2.rds")
+
+# get metadata
+annot.list <- lapply(seurat.list, function(x) x@meta.data[c("tech", "ref", GetScoreNames(AllMarkers), grep("annot_", colnames(x@meta.data), value = TRUE))])
+annot.list <- lapply(annot.list, function(x) {
+  x$cellnames <- rownames(x)
+  return(x)
+})
+annot_df <- rbindlist(annot.list, fill = TRUE, use.names = TRUE) %>% as.data.frame()
+annot_df$cellnames <- make.unique(annot_df$cellnames)
+
+split_obj <- AddMetaData(split_obj, annot_df)
+```
+
+## Cluster-Based Analysis
+In this section, the datasets are represented as distribution across clusters. Using the integrated space, similar cluster distibutions should reflect dataset similarity. To quantitatively assess the similarity, we use the Jensen-Shannon distance (JSD) and the Pearson correlation distance (PCD).
+
+```{r}
+vec_int <- c("cca", "cca_ref", "rpca", "rpca_ref", "mnn", "harmony")
+umap_vec <- c("umap.cca", "umap.cca_ref", "umap.rpca", "umap.rpca_ref", "umap.mnn", "umap.harmony")
+```
+
+```{r cluster-analysis}
+split_obj <- JoinLayers(split_obj)
+
+for (i in seq_along(vec_int)) {
+  split_obj <- FindNeighbors(split_obj, reduction = paste0("integrated.", vec_int[i])) %>%
+    FindClusters(resolution = 2, cluster.name = paste0(vec_int[i], "_clusters")) %>%
+    RunUMAP(reduction = paste0("integrated.", vec_int[i]), dims = 1:30, reduction.name = paste0("umap.", vec_int[i]))
+}
+```
+
+```{r}
+# sample_id = "Yu2021_PXGL"
+# split_obj$tech[split_obj$sample == sample_id] = "10x"
+# split_obj$ref[split_obj$sample == sample_id] = "model"
+```
+
+
+```{r}
+for (i in seq_along(vec_int)) {
+  int_method <- vec_int[i]
+  umap_int <- paste0("umap.", int_method)
+  DimPlot(split_obj, group.by = c("sample", "tech", "ref", "annot_major"), reduction = umap_int, pt.size = 0.5, shuffle = TRUE)
+  ggsave(paste0("04_integration/umap_emb/", int_method, "_umap.png"), width = 10, height = 6)
+}
+```
+
+
+```{r}
+split_obj <- subset(split_obj, features = which(!is.na(split_obj[["RNA"]][[]]$ensembl_gene_id)))
+newnames <- split_obj[["RNA"]][[]]$gene_names
+newnames[is.na(newnames)] <- rownames(split_obj)[is.na(newnames)]
+newnames <- make.unique(newnames)
+rownames(split_obj) <- newnames
+```
+
+```{r}
+marker_genes <- unlist(AllMarkers)
+marker_genes <- marker_genes[marker_genes %in% rownames(split_obj)]
+
+plotting.data <- cbind(split_obj@meta.data, t(GetAssayData(split_obj, assay = "RNA")[marker_genes, ]))
+
+umap_emb <- grep("umap", names(split_obj@reductions), value = TRUE)
+for (i in seq_along(umap_emb)) {
+  plotting.data <- cbind(plotting.data, Embeddings(split_obj, reduction = umap_emb[i]))
+}
+
+saveRDS(plotting.data, "plotting_data_revision_2.RDS")
+```
+
+```{r}
+plotting.data <- readRDS("../../results/plotting_data_revision_2.RDS")
+```
+
+```{r cluster identity barplots}
+for (i in seq_along(vec_int)) {
+  int_method <- vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+
+  p1 <- plotting.data %>%
+    group_by(.data[[cluster_column]]) %>%
+    count(sample) %>%
+    ggplot(aes(x = .data[[cluster_column]], y = n, fill = sample)) +
+    geom_col(position = "fill")
+  p2 <- plotting.data %>%
+    group_by(sample, .data[[cluster_column]]) %>%
+    count(tech) %>%
+    ggplot(aes(x = .data[[cluster_column]], y = n, fill = tech)) +
+    geom_col(position = "fill")
+  p3 <- plotting.data %>%
+    group_by(sample, .data[[cluster_column]]) %>%
+    count(ref) %>%
+    ggplot(aes(x = .data[[cluster_column]], y = n, fill = ref)) +
+    geom_col(position = "fill")
+  p4 <- plotting.data %>%
+    group_by(sample, .data[[cluster_column]]) %>%
+    count(annot_major) %>%
+    ggplot(aes(x = .data[[cluster_column]], y = n, fill = annot_major)) +
+    geom_col(position = "fill")
+
+  p1 / p2 / p3 / p4
+  ggsave(paste0("04_integration/figures/cluster_dist/", int_method, "_dist.png"), width = 10, height = 10)
+}
+# p1+coord_flip()|p2+coord_flip()|p3+coord_flip()|p4+coord_flip()
+```
+
+```{r cluster heatmap}
+# plotting.data = split_obj@meta.data
+
+for (i in seq_along(vec_int)) {
+  int_method <- vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+
+  p1 <- plotting.data %>%
+    group_by(.data[[cluster_column]]) %>%
+    count(sample) %>%
+    ggplot(aes(x = .data[[cluster_column]], y = n, fill = sample)) +
+    geom_col(position = "fill")
+  p2 <- plotting.data %>%
+    group_by(sample, .data[[cluster_column]]) %>%
+    count(tech) %>%
+    ggplot(aes(x = .data[[cluster_column]], y = n, fill = tech)) +
+    geom_col(position = "fill")
+  p3 <- plotting.data %>%
+    group_by(sample, .data[[cluster_column]]) %>%
+    count(ref) %>%
+    ggplot(aes(x = .data[[cluster_column]], y = n, fill = ref)) +
+    geom_col(position = "fill")
+  p4 <- plotting.data %>%
+    group_by(sample, .data[[cluster_column]]) %>%
+    count(annot_major) %>%
+    ggplot(aes(x = .data[[cluster_column]], y = n, fill = annot_major)) +
+    geom_col(position = "fill")
+
+  p1 / p2 / p3 / p4
+  ggsave(paste0("04_integration/figures/cluster_dist/", int_method, "_dist.png"), width = 10, height = 10)
+}
+# p1+coord_flip()|p2+coord_flip()|p3+coord_flip()|p4+coord_flip()
+```
+
+```{r}
+for (i in seq_along(vec_int)) {
+  require(viridis)
+
+  int_method <- vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+
+  # cluster by annotation
+  # plotting.data %>%
+  #   group_by(.data[[cluster_column]], annot_major) %>%
+  #   count(annot_major) %>%
+  #   ungroup(annot_major) %>%
+  #   mutate(total = sum(n),
+  #          prop = n/total) %>%
+  #   pivot_wider(names_from = annot_major, id_cols = .data[[cluster_column]], values_from = prop, values_fill = list(prop = 0)) -> tmp_wider
+  # hc_clust = hclust(dist(tmp_wider[,seq(2,5)]))
+
+  # cluster by dataset
+  plotting.data %>%
+    group_by(.data[[cluster_column]], sample) %>%
+    count(sample) %>%
+    ungroup(sample) %>%
+    mutate(
+      total = sum(n),
+      prop = n / total
+    ) %>%
+    pivot_wider(names_from = sample, id_cols = .data[[cluster_column]], values_from = prop, values_fill = list(prop = 0)) -> tmp_wider
+  hc_clust <- hclust(dist(tmp_wider[, seq(2, 5)]))
+
+  plotting.data %>%
+    group_by(.data[[cluster_column]], annot_major) %>%
+    count(annot_major) %>%
+    pivot_wider(names_from = annot_major, id_cols = .data[[cluster_column]], values_from = n, values_fill = list(n = 0)) %>%
+    pivot_longer(cols = unique(plotting.data$annot_major)) -> tmp_longer_ct
+
+  tmp_longer_ct[[cluster_column]] <- factor(tmp_longer_ct[[cluster_column]], levels = levels(tmp_longer_ct[[cluster_column]])[hc_clust$order])
+
+  p1 <- ggplot(tmp_longer_ct, aes(x = .data[[cluster_column]], y = value, fill = name)) +
+    geom_col(position = "fill") +
+    coord_flip() +
+    xlab("Clusters") +
+    ylab("Cell-Type Composition")
+  p1
+  # ggsave("04_integration/celltype_distribution_across_clusters.svg", height=10, width = 5)
+
+  plotting.data %>%
+    group_by(sample, .data[[cluster_column]]) %>%
+    count() %>%
+    ungroup(.data[[cluster_column]]) %>%
+    mutate(
+      total = sum(n),
+      prop = n / total
+    ) %>%
+    pivot_wider(names_from = sample, id_cols = .data[[cluster_column]], values_from = prop, values_fill = list(prop = 0)) -> tmp_wider
+
+  tmp_wider %>%
+    pivot_longer(cols = unique(plotting.data$sample)) -> tmp_longer
+
+  tmp_longer[[cluster_column]] <- factor(tmp_longer[[cluster_column]], levels = levels(tmp_longer[[cluster_column]])[hc_clust$order])
+
+  p2 <- ggplot(tmp_longer, aes(y = .data[[cluster_column]], x = name, fill = value)) +
+    geom_tile() +
+    theme_minimal() +
+    coord_fixed() +
+    scale_fill_viridis() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    ylab("Clusters") +
+    xlab("Datasets")
+  p2
+  # ggsave("04_integration/dataset_distribution_across_clusters.svg", height=10, width = 4)
+
+  wrap_plots(p1, p2)
+
+
+  tmp_mat <- as.matrix(tmp_wider[, seq(2, ncol(tmp_wider))])
+  rownames(tmp_mat) <- tmp_wider$rpca_clusters
+
+  # better_col_palette <- viridis::viridis(100)
+  better_col_palette <- RColorBrewer::brewer.pal(100, name = "Blues")
+
+  tmp_longer_ct %>%
+    group_by(.data[[cluster_column]]) %>%
+    mutate(value = value / sum(value)) %>%
+    pivot_wider(id_cols = .data[[cluster_column]], names_from = name) %>%
+    as.data.frame() -> tmp_wider_ct
+  m <- tmp_wider_ct[, -1]
+  rownames(m) <- tmp_wider_ct[[cluster_column]]
+  m <- m[, c(2, 4, 1, 3)]
+  require(scales)
+  hex4 <- hue_pal()(4)
+  hex3 <- hue_pal()(3)
+  celltype_color <- c(hex3, "lightgrey")
+  # names(hex3) <- c("Group1", "Group2", "Group3")
+  row_annotation <- rowAnnotation(Celltype = anno_barplot(m,
+    gp = gpar(fill = celltype_color, col = celltype_color),
+    bar_width = 0.9, width = unit(4, "cm")
+  ), show_annotation_name = FALSE)
+  # row_df <- data.frame(Group = c(
+  #   "Group3", "Group1", "Group1", "Group1", "Group3", "Group1", "Group1",
+  #   "Group1", "Group2", "Group2"
+  # ), row.names = colnames(tmp_mat))
+  # col_annotation <- HeatmapAnnotation(df = row_df, col = list(Group = hex3), show_annotation_name = FALSE)
+  library(cluster)
+  tmp_mat_sc <- sweep(tmp_mat, 1, apply(tmp_mat, 1, sum), "/")
+  # tmp_mat_sc = t(apply(tmp_mat, 1, scale))
+  colnames(tmp_mat_sc) <- colnames(tmp_mat)
+  ht <- Heatmap(tmp_mat_sc,
+    name = "Cell Proportions",
+    clustering_distance_rows = "euclidean",
+    clustering_method_rows = "complete",
+    col = better_col_palette,
+    # top_annotation = col_annotation,
+    right_annotation = row_annotation,
+    rect_gp = gpar(col = "white", lwd = 0.5),
+    width = unit(ncol(tmp_mat) * 5, "mm"),
+    height = unit(nrow(tmp_mat) * 5, "mm")
+  )
+  lg_list <- list(Legend(labels = c("Epiblast", "Primitive Endoderm", "Trophectoderm", "Unknown"), title = "Cell Types", legend_gp = gpar(fill = celltype_color)))
+  svg(filename = paste0("04_integration/figures/cluster_merged/dataset_distribution_across_", int_method, "_clusters_rownorm_merged.svg"), width = 7, height = 9)
+  draw(ht, annotation_legend_list = lg_list, merge_legend = TRUE)
+  dev.off()
+
+  tmp_mat_sc <- sweep(tmp_mat, 2, apply(tmp_mat, 2, sum), "/")
+  # tmp_mat_sc = t(apply(tmp_mat, 2, scale))
+  colnames(tmp_mat_sc) <- colnames(tmp_mat)
+  ht <- Heatmap(tmp_mat_sc,
+    name = "Cell Proportions",
+    clustering_distance_rows = "euclidean",
+    clustering_method_rows = "complete",
+    col = better_col_palette,
+    # top_annotation = col_annotation,
+    right_annotation = row_annotation,
+    rect_gp = gpar(col = "white", lwd = 0.5),
+    width = unit(ncol(tmp_mat) * 5, "mm"),
+    height = unit(nrow(tmp_mat) * 5, "mm")
+  )
+  lg_list <- list(Legend(labels = c("Epiblast", "Primitive Endoderm", "Trophectoderm", "Unknown"), title = "Cell Types", legend_gp = gpar(fill = hex4)))
+  svg(paste0("04_integration/figures/cluster_merged/dataset_distribution_across_", int_method, "_clusters_colnorm_merged.svg"), width = 7, height = 9)
+  draw(ht, annotation_legend_list = lg_list, merge_legend = TRUE)
+  dev.off()
+
+  tmp_mat_sc <- tmp_mat / sum(tmp_mat)
+  # tmp_mat_sc = t(apply(tmp_mat, 2, scale))
+  colnames(tmp_mat_sc) <- colnames(tmp_mat)
+  ht <- Heatmap(tmp_mat_sc,
+    name = "Cell Proportions",
+    clustering_distance_rows = "euclidean",
+    clustering_method_rows = "complete",
+    col = better_col_palette,
+    # top_annotation = col_annotation,
+    right_annotation = row_annotation,
+    rect_gp = gpar(col = "white", lwd = 0.5),
+    width = unit(ncol(tmp_mat) * 5, "mm"),
+    height = unit(nrow(tmp_mat) * 5, "mm")
+  )
+  lg_list <- list(Legend(labels = c("Epiblast", "Primitive Endoderm", "Trophectoderm", "Unknown"), title = "Cell Types", legend_gp = gpar(fill = hex4)))
+  svg(paste0("04_integration/figures/cluster_merged/dataset_distribution_across_", int_method, "_clusters_allnorm_merged.svg"), width = 7, height = 9)
+  draw(ht, annotation_legend_list = lg_list, merge_legend = TRUE)
+  dev.off()
+}
+
+
+# svg("04_integration/dataset_distribution_across_clusters_allscaled.svg", width = 3.5, height = 9)
+# p3 = pheatmap::pheatmap(tmp_mat, color = better_col_palette)
+# p3
+# dev.off()
+#
+# svg("04_integration/dataset_distribution_across_clusters_rowscaled.svg", width = 3.5, height = 9)
+# p3 = pheatmap::pheatmap(tmp_mat, scale="row", color = better_col_palette)
+# p3
+# dev.off()
+#
+# svg("04_integration/dataset_distribution_across_clusters_colscaled.svg", width = 3.5, height = 9)
+# p3 = pheatmap::pheatmap(tmp_mat, scale="column", color = better_col_palette)
+# p3
+# dev.off()
+
+
+tmp_longer[[cluster_column]] <- factor(tmp_longer[[cluster_column]], levels = p3$tree_row$labels[rev(p3$tree_row$order)])
+
+p1 <- ggplot(tmp_longer, aes(x = .data[[cluster_column]], y = value, fill = name)) +
+  geom_col(position = "fill") +
+  coord_flip() +
+  xlab("Clusters") +
+  ylab("Cell-Type Composition")
+p1
+```
+
+
+
+```{r}
+for (i in seq_along(vec_int)) {
+  int_method <- vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+
+  plotting.data %>%
+    group_by(.data[[cluster_column]]) %>%
+    count(tech) %>%
+    pivot_wider(names_from = tech, values_from = n, values_fill = list(n = 0)) %>%
+    ggplot(aes(x = `10x`, y = SS2)) +
+    geom_point() +
+    ggtitle(paste0("Tech fraction for ", int_method, " integration"))
+
+  ggsave(paste0("04_integration/cluster_tech_fraction/", int_method, "_dist.png"), width = 5, height = 5)
+}
+```
+
+```{r}
+# 1C
+
+mat <- reshape2::melt(plotting.data)
+group.label <- "sample"
+
+for (i in seq_along(vec_int)) {
+  in0t_method <- vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+
+  mat %>%
+    group_by(.data[[group.label]]) %>%
+    count(.data[[cluster_column]]) -> mat2
+  mat2 %>%
+    group_by(.data[[group.label]]) %>%
+    mutate(n = minmaxNormalization(n)) -> mat3
+
+  mat3$`frac. of cells` <- mat3$n
+  p1 <- ggplot(mat3, aes_string(y = cluster_column, x = group.label, fill = "`frac. of cells`")) +
+    geom_tile() +
+    xlab("Datasets") +
+    ylab("Clusters") +
+    scale_fill_viridis_c() +
+    theme(
+      panel.border = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "grey50")
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    ggtitle(paste0(int_method, " dataset distribution"))
+  p1
+  ggsave(paste0("04_integration/cluster_tilemap/", int_method, "_cluster_tile.svg"), width = 4, height = 10, dpi = "retina")
+}
+```
+
+```{r}
+# 1E
+for (i in seq_along(vec_int)) {
+  int_method <- vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+  umaplab1 <- paste0("umap", gsub("_", "", int_method), "_1")
+  umaplab2 <- paste0("umap", gsub("_", "", int_method), "_2")
+
+  sampled_data <- plotting.data %>%
+    group_by(sample) %>%
+    sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct() # Remove duplicates
+  p1 <- ggplot() +
+    geom_point(
+      data = sampled_data, mapping = aes(x = .data[[umaplab1]], y = .data[[umaplab2]], col = .data[[cluster_column]]),
+      size = 0.3
+    ) + # , alpha=0.3)+
+    plotting.data %>%
+    group_by(.data[[cluster_column]]) %>%
+    summarise(UMAP_1 = mean(.data[[umaplab1]]), UMAP_2 = mean(.data[[umaplab2]])) %>%
+    geom_text_repel(mapping = aes(x = UMAP_1, y = UMAP_2, label = .data[[cluster_column]]), size = 5) +
+    theme_void() +
+    theme(legend.position = "none")
+  p1
+  ggsave(paste0("04_integration/cluster_umap/", int_method, "_cluster_umap.svg"), width = 5, height = 4, dpi = "retina")
+}
+```
+
+
+```{r}
+mat <- reshape2::melt(plotting.data)
+group.label <- "sample"
+for (i in seq_along(vec_int)) {
+  int_method <- vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+  umaplab1 <- paste0("umap", gsub("_", "", int_method), "_1")
+  umaplab2 <- paste0("umap", gsub("_", "", int_method), "_2")
+
+  mat5 <- mat %>%
+    group_by(.data[[group.label]]) %>%
+    count(.data[[cluster_column]]) %>%
+    pivot_wider(names_from = sample, values_from = n, values_fill = list(n = 0))
+  rownames(mat5) <- mat5[[cluster_column]]
+  mat5 <- mat5[, -1]
+  mat5[is.na(mat5)] <- 0
+  mat5 <- apply(mat5, 2, scale)
+
+  pc5 <- prcomp(mat5)
+  pcmat5 <- as.data.frame(pc5$rotation)
+  # ggplot(pcmat5, aes(x=PC1, y=PC2, color=rownames(pcmat5), shape=Ref.sample))+
+  #   geom_point()
+
+  pcmat5$`Sequencing\n Platform` <- mat$tech[match(rownames(pcmat5), mat$sample)]
+  pcmat5$Source <- factor(mat$ref[match(rownames(pcmat5), mat$sample)])
+  levels(pcmat5$Source) <- c("blastoid", "blastocyst")
+  p4 <- ggplot(pcmat5, aes(x = PC1, y = PC2, color = Source, shape = `Sequencing\n Platform`)) +
+    geom_point() +
+    geom_text_repel(aes(label = rownames(pcmat5)), show.legend = FALSE) +
+    xlab(paste0("PC1 (s.d.=", round(pc5$sdev[1] * 100 / sum(pc5$sdev)), "%)")) +
+    ylab(paste0("PC2 (s.d.=", round(pc5$sdev[2] * 100 / sum(pc5$sdev)), "%)")) +
+    theme_bw() +
+    ggtitle(paste0(int_method, " cluster distribution PCA")) +
+    theme(axis.title = element_text(size = 15), panel.grid = element_blank())
+  p4
+  ggsave(paste0("../../04_integration/figures/cluster_pca/", int_method, "_cluster_PCA.svg"), width = 5.5, height = 4)
+  # ggsave(paste0("04_integration/cluster_pca/",int_method,"_cluster_PCA.png"), width = 6, height = 4.5, dpi = "retina")
+}
+```
+
+### Jensen-Shannon Distance
+JSD computes the similarity between two distributions. It includes non-shared clusters into the computation of similarity. 
+
+```{r JSD}
+for (i in seq_along(vec_int)) {
+  int_method <- vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+
+  jsd.mat <- getJSDMatrix(mat[[cluster_column]], mat$sample)
+  idx_ord <- order(jsd.mat[rownames(jsd.mat) == "Petropoulos2016_ref", ])
+  M <- jsd.mat[idx_ord, idx_ord]
+
+  require(ComplexHeatmap)
+  require(circlize)
+  svg(filename = paste0("04_integration/integration_jsd/", int_method, "_integration_JSD_heatmap.svg"), width = 8, height = 6.5, pointsize = 320)
+  Heatmap(M,
+    name = "Jensen\nShannon\nDistance",
+    width = ncol(M) * unit(10, "mm"),
+    height = nrow(M) * unit(10, "mm"),
+    # col = colorRamp2(c(0, 1), c("greenyellow", "red"))) %>%
+    col = colorRamp2(c(min(M), max(M)), c("greenyellow", "red"))
+  ) %>%
+    draw()
+  dev.off()
+}
+```
+
+### Pearson-Correlation Distance
+Computes similarity of 
+```{r}
+library(dplyr)
+for (i in seq_along(vec_int)) {
+  int_method <- vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+
+  mat %>%
+    group_by(.data[[group.label]]) %>%
+    count(.data[[cluster_column]]) %>%
+    # mutate(total = sum(n), # Calculate the total counts per group
+    #        prop = n / total) %>% # Calculate the proportion of each count
+    # ungroup() %>% # Remove grouping
+    # select(-total) %>% # Optionally, remove the total column if not needed
+    # mutate(n=minmaxNormalization(n)) %>%
+    pivot_wider(names_from = sample, values_from = n, values_fill = list(n = 0)) -> mat3
+  mat3[, -1] <- sweep(mat3[, -1], 2, colSums(mat3[, -1]), "/")
+  mat3[mat3 == 0] <- NA
+  M <- cor(mat3[, -1], use = "pairwise.complete.obs")
+  M <- (1 - M) / 2
+  # Heatmap(M)
+  idx_ord <- order(M[rownames(M) == "Petropoulos2016_ref", ])
+  M <- M[idx_ord, idx_ord]
+
+  require(ComplexHeatmap)
+  require(circlize)
+  svg(filename = paste0("04_integration/integration_pcd/", int_method, "_integration_PCD_heatmap.svg"), width = 8, height = 6.5, pointsize = 320)
+  Heatmap(M,
+    name = "Pearson\nCorrelation\nDistance",
+    width = ncol(M) * unit(10, "mm"),
+    height = nrow(M) * unit(10, "mm"),
+    # col = colorRamp2(c(0, 1), c("greenyellow", "red"))) %>%
+    col = colorRamp2(c(min(M), max(M)), c("greenyellow", "red"))
+  ) %>%
+    draw()
+  dev.off()
+}
+```
+
+```{r}
+library(scales)
+hex3 <- hue_pal()(3)
+celltype_color <- c(hex3, "lightgrey")
+
+for (i in seq_along(vec_int)) {
+  int_method <- vec_int[i]
+  # cluster_column <- paste0(int_method, "_clusters")
+  cluster_column <- "annot_major"
+  umaplab1 <- paste0("umap", gsub("_", "", int_method), "_1")
+  umaplab2 <- paste0("umap", gsub("_", "", int_method), "_2")
+
+  # sampled_data <- plotting.data %>%
+  #   group_by(sample) %>%
+  #   sample_n(size = 5000, replace = TRUE) %>%
+  #   ungroup() %>%
+  #   distinct() # Remove duplicates
+  p1 <- ggplot() +
+    geom_point(
+      data = plotting.data, mapping = aes(x = .data[[umaplab1]], y = .data[[umaplab2]], col = .data[[cluster_column]]),
+      size = 0.3
+    ) + # , alpha=0.3)+
+    scale_color_manual(values = celltype_color) +
+    # plotting.data %>%
+    # group_by(.data[[cluster_column]]) %>%
+    # summarise(UMAP_1 = mean(.data[[umaplab1]]), UMAP_2 = mean(.data[[umaplab2]])) %>%
+    # geom_text_repel(mapping = aes(x = UMAP_1, y = UMAP_2, label = .data[[cluster_column]]), size = 5) +
+    theme_void() +
+    theme(legend.position = "none")
+  p1
+  ggsave(paste0("04_integration/figures/annot_umap/", int_method, "_cluster_umap.svg"), width = 5, height = 4, dpi = "retina")
+}
+```
+
+```{r}
+for (i in seq_along(vec_int)) {
+  int_method <- vec_int[i]
+  # cluster_column <- paste0(int_method, "_clusters")
+  cluster_column <- "sample"
+  umaplab1 <- paste0("umap", gsub("_", "", int_method), "_1")
+  umaplab2 <- paste0("umap", gsub("_", "", int_method), "_2")
+
+  sampled_data <- plotting.data %>%
+    group_by(sample) %>%
+    sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct() # Remove duplicates
+  p1 <- ggplot() +
+    geom_point(
+      data = sampled_data, mapping = aes(x = .data[[umaplab1]], y = .data[[umaplab2]], col = .data[[cluster_column]]),
+      size = 0.3
+    ) + # , alpha=0.3)+
+    # plotting.data %>% group_by(.data[[cluster_column]]) %>% summarise(UMAP_1=mean(.data[[umaplab1]]), UMAP_2=mean(.data[[umaplab2]])) %>%
+    # geom_text_repel(mapping = aes(x=UMAP_1, y=UMAP_2, label=.data[[cluster_column]]), size=5)+
+    theme_void()
+  # theme(legend.position = "none")
+  p1
+  ggsave(paste0("04_integration/sample_umap/", int_method, "_cluster_umap.svg"), width = 7, height = 4, dpi = "retina")
+}
+```
+
+```{r}
+for (i in seq_along(vec_int)) {
+  int_method <- vec_int[i]
+  # cluster_column <- paste0(int_method, "_clusters")
+  cluster_column <- "tech"
+  umaplab1 <- paste0("umap", gsub("_", "", int_method), "_1")
+  umaplab2 <- paste0("umap", gsub("_", "", int_method), "_2")
+
+  sampled_data <- plotting.data %>%
+    group_by(sample) %>%
+    sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct() # Remove duplicates
+  p1 <- ggplot() +
+    geom_point(
+      data = sampled_data, mapping = aes(x = .data[[umaplab1]], y = .data[[umaplab2]], col = .data[[cluster_column]]),
+      size = 0.3
+    ) + # , alpha=0.3)+
+    # plotting.data %>% group_by(.data[[cluster_column]]) %>% summarise(UMAP_1=mean(.data[[umaplab1]]), UMAP_2=mean(.data[[umaplab2]])) %>%
+    # geom_text_repel(mapping = aes(x=UMAP_1, y=UMAP_2, label=.data[[cluster_column]]), size=5)+
+    theme_void()
+  # theme(legend.position = "none")
+  p1
+  ggsave(paste0("04_integration/tech_umap/", int_method, "_cluster_umap.svg"), width = 7, height = 4, dpi = "retina")
+}
+```
+
+```{r}
+for (i in seq_along(vec_int)) {
+  int_method <- vec_int[i]
+  # cluster_column <- paste0(int_method, "_clusters")
+  cluster_column <- "ref"
+  umaplab1 <- paste0("umap", gsub("_", "", int_method), "_1")
+  umaplab2 <- paste0("umap", gsub("_", "", int_method), "_2")
+
+  sampled_data <- plotting.data %>%
+    group_by(sample) %>%
+    sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct() # Remove duplicates
+  p1 <- ggplot() +
+    geom_point(
+      data = sampled_data, mapping = aes(x = .data[[umaplab1]], y = .data[[umaplab2]], col = .data[[cluster_column]]),
+      size = 0.3
+    ) + # , alpha=0.3)+
+    # plotting.data %>% group_by(.data[[cluster_column]]) %>% summarise(UMAP_1=mean(.data[[umaplab1]]), UMAP_2=mean(.data[[umaplab2]])) %>%
+    # geom_text_repel(mapping = aes(x=UMAP_1, y=UMAP_2, label=.data[[cluster_column]]), size=5)+
+    theme_void()
+  # theme(legend.position = "none")
+  p1
+  ggsave(paste0("04_integration/ref_umap/", int_method, "_cluster_umap.svg"), width = 7, height = 4, dpi = "retina")
+}
+```
+
+
+## PE Types
+```{r}
+# SaveH5Seurat(split_obj, filename = "annotated_preintegrated_seurat_object")
+split_obj <- LoadH5Seurat("annotated_preintegrated_seurat_object.h5seurat")
+Idents(split_obj) <- "rpca_clusters"
+```
+
+
+```{r}
+DimPlot(split_obj, group.by = c("annot_major", "rpca_clusters"), reduction = "umap.rpca", label = TRUE)
+select_clust <- split_obj$rpca_clusters %in% c(1, 2, 33, 28)
+table(split_obj$sample[select_clust], as.character(split_obj$rpca_clusters)[select_clust])
+
+# choose datasets with cells in both clusters of interest (1 vs 2,33)
+check.data <- c("Fan2021", "Sozen2021", "Yu2021_5iLA", "Yu2021_PXGL")
+seurat.mutualpe <- seurat.list[check.data]
+lapply(seurat.mutualpe, function(seurat.obj) {
+  table(seurat.obj$sample[select_clust], as.character(seurat.obj$rpca_clusters)[select_clust])
+})
+
+# transfer cluster labels
+seurat.mutualpe <- lapply(seurat.mutualpe, function(seurat.obj) {
+  print(unique(seurat.obj$sample))
+  meta_df <- data.frame(rpca_clusters = split_obj$rpca_clusters[split_obj$sample == unique(seurat.obj$sample)])
+  cellnames <- colnames(split_obj)[split_obj$sample == unique(seurat.obj$sample)]
+  cellnames <- sub("[^_]*$", "", cellnames)
+  rownames(meta_df) <- substr(cellnames, 1, nchar(cellnames) - 1)
+  seurat.obj <- AddMetaData(seurat.obj, meta_df)
+  return(seurat.obj)
+})
+pemarkers.ls <- lapply(seurat.mutualpe, function(seurat.obj) {
+  Idents(seurat.obj) <- "rpca_clusters"
+  # petype.markers = FindMarkers(seurat.obj, ident.1 = 1, ident.2 = c(33))
+  petype.type1.markers <- FindMarkers(seurat.obj, ident.1 = 1, logfc.threshold = 1)
+  petype.type2.markers <- FindMarkers(seurat.obj, ident.1 = c(2, 33), logfc.threshold = 1)
+  petype.type2.markers$avg_log2FC <- petype.type2.markers$avg_log2FC * -1
+  petype.markers <- rbind(petype.type1.markers, petype.type2.markers)
+  gene.idx <- match(rownames(petype.markers), rownames(seurat.obj))
+  gene.names <- seurat.obj[["RNA"]][[]]$gene_names[gene.idx]
+  drop_na <- !is.na(gene.names)
+  petype.markers <- petype.markers[drop_na, ]
+  petype.markers$gene <- make.unique(gene.names[drop_na])
+  petype.markers$gene2 <- rownames(petype.markers)
+  petype.markers <- petype.markers %>%
+    filter(abs(avg_log2FC) > 1)
+  petype.markers$cluster <- ifelse(petype.markers$avg_log2FC > 0, "TypeI", "TypeII")
+  return(petype.markers)
+})
+
+pemarkers <- rbindlist(pemarkers.ls, use.names = TRUE, idcol = TRUE)
+pemarkers <- as.data.frame(pemarkers)
+
+# keep markers shared across datasets
+keep_gene <- pemarkers$gene %in% unique(pemarkers$gene[rowSums(table(pemarkers$gene, pemarkers$.id)) > 3])
+pemarkers <- pemarkers[keep_gene, ]
+
+pemarkers %>%
+  group_by(cluster) %>%
+  slice_head(n = 10) %>%
+  ungroup() -> top10
+```
+
+```{r}
+tmp_data <- plotting.data
+counts_pe_sub <- split_obj[["RNA"]]$data[split_obj[["RNA"]][[]]$hgnc_symbol %in% top10$gene2, ]
+hgnc_symbol <- split_obj[["RNA"]][[]]$hgnc_symbol[split_obj[["RNA"]][[]]$hgnc_symbol %in% top10$gene2]
+rownames(counts_pe_sub) <- hgnc_symbol
+top10 <- top10[top10$gene2 %in% hgnc_symbol, ]
+tmp_data <- cbind(tmp_data, as.data.frame(t(counts_pe_sub)))
+
+figure_marker_umap_pe_subtype1 <- function(Scores = top10$gene[top10$cluster == "TypeI"]) {
+  Scores <- Scores[Scores %in% colnames(tmp_data)] # filter
+  df1 <- tmp_data %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(sample, variable) %>%
+    mutate(value = minmaxNormalization(value))
+
+  df1$sample <- factor(df1$sample)
+  df1$sample <- fct_inorder(df1$sample)
+  # df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  df1 <- df1 %>%
+    group_by(sample) %>%
+    # sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct() # Remove duplicates
+
+  p1 <-
+    ggplot() +
+    geom_point(data = df1 %>% arrange(value), aes(x = UMAP_1, y = UMAP_2, col = value), size = 0.5) +
+    # geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(size = 0.5) +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      text = element_text(),
+      axis.ticks = element_blank(),
+      axis.text = element_blank()
+    ) +
+    scale_color_viridis_c(option = "viridis") +
+    facet_grid(sample ~ variable)
+
+  df1 %>%
+    filter(is.na(value) == FALSE) %>%
+    arrange(value) -> df2
+  df1 %>% filter(is.na(value) == TRUE) -> df3
+  p2 <-
+    ggplot() +
+    geom_point(data = df3, aes(x = UMAP_1, y = UMAP_2, col = value), size = 0.5) +
+    geom_point(data = df2, aes(x = UMAP_1, y = UMAP_2, col = value), size = 0.5) +
+    # geom_point(df1 %>% arrange(is.na(value)) %>%  arrange(value),
+    #            aes_string(x='UMAP_1',y='UMAP_2',col='value'), size=0.5)+
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      text = element_text(),
+      axis.ticks = element_blank(),
+      axis.text = element_blank()
+    ) +
+    scale_color_viridis_c(option = "viridis") +
+    facet_wrap(~variable, nrow = 1)
+  # p2
+  wrap_plots(list(p2, p1), heights = c(1, 10))
+}
+figure_marker_umap_pe_subtype2 <- function(Scores = top10$gene[top10$cluster == "TypeII"]) {
+  Scores <- Scores[Scores %in% colnames(tmp_data)] # filter
+  df1 <- tmp_data %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(sample, variable) %>%
+    mutate(value = minmaxNormalization(value))
+
+  df1$sample <- factor(df1$sample)
+  df1$sample <- fct_inorder(df1$sample)
+  # df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  df1 <- df1 %>%
+    group_by(sample) %>%
+    # sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct() # Remove duplicates
+
+  p1 <-
+    ggplot() +
+    geom_point(data = df1 %>% arrange(value), aes(x = UMAP_1, y = UMAP_2, col = value), size = 0.5) +
+    # geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(size = 0.5) +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      text = element_text(),
+      axis.ticks = element_blank(),
+      axis.text = element_blank()
+    ) +
+    scale_color_viridis_c(option = "viridis") +
+    facet_grid(sample ~ variable)
+
+  df1 %>%
+    filter(is.na(value) == FALSE) %>%
+    arrange(value) -> df2
+  df1 %>% filter(is.na(value) == TRUE) -> df3
+  p2 <-
+    ggplot() +
+    geom_point(data = df3, aes(x = UMAP_1, y = UMAP_2, col = value), size = 0.5) +
+    geom_point(data = df2, aes(x = UMAP_1, y = UMAP_2, col = value), size = 0.5) +
+    # geom_point(df1 %>% arrange(is.na(value)) %>%  arrange(value),
+    #            aes_string(x='UMAP_1',y='UMAP_2',col='value'), size=0.5)+
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      text = element_text(),
+      axis.ticks = element_blank(),
+      axis.text = element_blank()
+    ) +
+    scale_color_viridis_c(option = "viridis") +
+    facet_wrap(~variable, nrow = 1)
+  # p2
+  wrap_plots(list(p2, p1), heights = c(1, 10))
+}
+
+fig_width <- sum(top10$cluster == "TypeI") * 1.75
+figure_marker_umap_pe_subtype1()
+ggsave(paste0("05_analysis/marker_pe_type/marker_cons_clust1vall_type1_", int_method, "_umap.png"), width = fig_width, height = 16)
+
+fig_width <- sum(top10$cluster == "TypeII") * 1.75
+figure_marker_umap_pe_subtype2()
+ggsave(paste0("05_analysis/marker_pe_type/marker_cons_clust2n33vall_type2_", int_method, "_umap.png"), width = fig_width, height = 16)
+```
+
+
+
+```{r}
+epitype.markers <- FindMarkers(split_obj, ident.1 = 1, ident.2 = c(2, 33))
+gene.idx <- match(rownames(epitype.markers), rownames(split_obj))
+gene.names <- split_obj[["RNA"]][[]]$gene_names[gene.idx]
+drop_na <- !is.na(gene.names)
+epitype.markers <- epitype.markers[drop_na, ]
+epitype.markers$gene <- make.unique(gene.names[drop_na])
+epitype.markers$gene2 <- rownames(epitype.markers)
+epitype.markers <- epitype.markers %>%
+  filter(abs(avg_log2FC) > 1)
+epitype.markers$cluster <- ifelse(epitype.markers$avg_log2FC > 0, "TypeI", "TypeII")
+epitype.markers %>%
+  group_by(cluster) %>%
+  slice_head(n = 10) %>%
+  ungroup() -> top10
+DoHeatmap(split_obj, features = top10$gene2) + NoLegend()
+
+epitype.markers %>%
+  group_by(cluster) %>%
+  slice_head(n = 5) %>%
+  ungroup() -> top5
+
+tmp_data <- plotting.data
+counts_pe_sub <- split_obj[["RNA"]]$data[top10$gene2, ]
+rownames(counts_pe_sub) <- top10$gene
+tmp_data <- cbind(tmp_data, as.data.frame(t(counts_pe_sub)))
+
+figure_marker_umap_pe_subtype1 <- function(Scores = top10$gene[top10$cluster == "TypeI"]) {
+  Scores <- Scores[Scores %in% colnames(tmp_data)] # filter
+  df1 <- tmp_data %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(sample, variable) %>%
+    mutate(value = minmaxNormalization(value))
+
+  df1$sample <- factor(df1$sample)
+  df1$sample <- fct_inorder(df1$sample)
+  # df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  df1 <- df1 %>%
+    group_by(sample) %>%
+    # sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct() # Remove duplicates
+
+  p1 <-
+    ggplot() +
+    geom_point(data = df1 %>% arrange(value), aes(x = UMAP_1, y = UMAP_2, col = value), size = 0.5) +
+    # geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(size = 0.5) +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      text = element_text(),
+      axis.ticks = element_blank(),
+      axis.text = element_blank()
+    ) +
+    scale_color_viridis_c(option = "viridis") +
+    facet_grid(sample ~ variable)
+
+  df1 %>%
+    filter(is.na(value) == FALSE) %>%
+    arrange(value) -> df2
+  df1 %>% filter(is.na(value) == TRUE) -> df3
+  p2 <-
+    ggplot() +
+    geom_point(data = df3, aes(x = UMAP_1, y = UMAP_2, col = value), size = 0.5) +
+    geom_point(data = df2, aes(x = UMAP_1, y = UMAP_2, col = value), size = 0.5) +
+    # geom_point(df1 %>% arrange(is.na(value)) %>%  arrange(value),
+    #            aes_string(x='UMAP_1',y='UMAP_2',col='value'), size=0.5)+
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      text = element_text(),
+      axis.ticks = element_blank(),
+      axis.text = element_blank()
+    ) +
+    scale_color_viridis_c(option = "viridis") +
+    facet_wrap(~variable, nrow = 1)
+  # p2
+  wrap_plots(list(p2, p1), heights = c(1, 10))
+}
+figure_marker_umap_pe_subtype2 <- function(Scores = top10$gene[top10$cluster == "TypeII"]) {
+  Scores <- Scores[Scores %in% colnames(tmp_data)] # filter
+  df1 <- tmp_data %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(sample, variable) %>%
+    mutate(value = minmaxNormalization(value))
+
+  df1$sample <- factor(df1$sample)
+  df1$sample <- fct_inorder(df1$sample)
+  # df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  df1 <- df1 %>%
+    group_by(sample) %>%
+    # sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct() # Remove duplicates
+
+  p1 <-
+    ggplot() +
+    geom_point(data = df1 %>% arrange(value), aes(x = UMAP_1, y = UMAP_2, col = value), size = 0.5) +
+    # geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(size = 0.5) +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      text = element_text(),
+      axis.ticks = element_blank(),
+      axis.text = element_blank()
+    ) +
+    scale_color_viridis_c(option = "viridis") +
+    facet_grid(sample ~ variable)
+
+  df1 %>%
+    filter(is.na(value) == FALSE) %>%
+    arrange(value) -> df2
+  df1 %>% filter(is.na(value) == TRUE) -> df3
+  p2 <-
+    ggplot() +
+    geom_point(data = df3, aes(x = UMAP_1, y = UMAP_2, col = value), size = 0.5) +
+    geom_point(data = df2, aes(x = UMAP_1, y = UMAP_2, col = value), size = 0.5) +
+    # geom_point(df1 %>% arrange(is.na(value)) %>%  arrange(value),
+    #            aes_string(x='UMAP_1',y='UMAP_2',col='value'), size=0.5)+
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      text = element_text(),
+      axis.ticks = element_blank(),
+      axis.text = element_blank()
+    ) +
+    scale_color_viridis_c(option = "viridis") +
+    facet_wrap(~variable, nrow = 1)
+  # p2
+  wrap_plots(list(p2, p1), heights = c(1, 10))
+}
+
+fig_width <- 10 * 1.75
+figure_marker_umap_pe_subtype1()
+ggsave(paste0("05_analysis/marker_pe_type/marker_type1_", int_method, "_umap.png"), width = fig_width, height = 16)
+
+figure_marker_umap_pe_subtype2()
+ggsave(paste0("05_analysis/marker_pe_type/marker_type2_", int_method, "_umap.png"), width = fig_width, height = 16)
+
+
+FeaturePlot(split_obj, features = top5$gene2[top5$cluster == "TypeI"], reduction = umap_int, split.by = "sample")
+ggsave()
+
+plts <- FeaturePlot(split_obj, features = top5$gene2[top5$cluster == "TypeI"], reduction = umap_int, split.by = "sample", combine = FALSE)
+plts <- lapply(plts, function(plt) {
+  plt + theme_minimal() +
+    theme(
+      axis.title = element_blank(),
+      axis.text = element_blank()
+    )
+  return(plt)
+})
+facet_wrap(plts)
+
+FeaturePlot(split_obj, features = top5$gene2[top5$cluster == "TypeII"], reduction = umap_int, split.by = "sample") + theme_minimal() +
+  theme(axis.title = element_blank(), axis.text = element_blank())
+```

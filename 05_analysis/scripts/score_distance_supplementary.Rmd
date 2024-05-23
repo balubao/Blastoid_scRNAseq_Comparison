@@ -1,0 +1,542 @@
+---
+title: "score_distance_supplementary"
+author: "Ali Balubaid"
+date: "2024-02-26"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# set-up
+
+# renv::deactivate()
+source("../..w/script/Initiation.R", verbose = FALSE)
+
+require(gridExtra)
+require(grid)
+require(lattice)
+```
+
+
+# Supplementary file
+
+## Comment from Reviewer
+In the Marker Enrichment analysis, the author bootstrap 1,000 times to calculate KSD. 
+The authors should explain how the differences in the number of cells between different datasets were controlled.
+
+In response to the reviewer's request, we explore how different sampling rates impact KSD results.
+
+### load data
+```{r}
+# seurat_obj = LoadH5Seurat("intregrated_all_final.h5seurat")
+
+```
+
+### Recompute Scores
+We recompute the scores using most up-to-date gene list.
+```{r Recompute scores}
+# Function to remove characters before the first period in a string
+AllMarkers = GetSCTypeMarkers("Embryo_Sam2")
+names(AllMarkers) = sapply(names(AllMarkers), function(x) gsub("/","_",x))
+# seurat_obj = ResetModuleScores(integrated = seurat_obj, tissue = "Embryo_Sam2")
+
+```
+
+```{r Extract data for analysis}
+Scores = GetScoreNames(AllMarkers)
+
+# plotting.data = cbind(seurat_obj@meta.data, Embeddings(seurat_obj, reduction = "umap"), t(GetAssayData(seurat_obj, assay = "SCT")[unlist(AllMarkers),]))
+# plotting.data$cluster = plotting.data$seurat_clusters
+plotting.data = readRDS("plotting_data_revision_2.RDS")
+plotting.data$cluster = plotting.data$rpca_clusters
+mat = reshape2::melt(plotting.data)
+
+```
+
+### Compute Distances
+```{r define functions}
+## Plot heatmaps with clustering
+ScoreDistance_wrapper_V2 = function(j, lab_rank='medianRank'){
+  
+  mat %>% filter(variable %in% Scores[j]) %>%
+    filter(!is.na(value)) %>%
+    group_by(sample) %>%
+    mutate(value = scale(value)) %>% 
+    dplyr::select(sample, variable, value) -> mat7
+  # Calculate the minimum number of elements per sample
+  min_sample_count <- mat7 %>%
+    group_by(sample) %>%
+    summarise(sample_count = n()) %>%
+    pull(sample_count) %>%
+    min()
+  
+  
+  Nbootstrap=1000
+  
+  # Load libraries on each worker
+  clusterEvalQ(cl, library(dplyr))
+  # Export data to all workers
+  clusterExport(cl, varlist = c("mat7","min_sample_count","getKSDMatrix"))  # Add other variables if needed
+  
+  ksd_list = parLapply(cl, seq(Nbootstrap), function(i){
+    # Create a new balanced dataframe
+    balanced_mat7 <- mat7 %>%
+      group_by(sample) %>%
+      sample_n(min_sample_count, replace = FALSE) %>%
+      ungroup()
+    
+    ksd.mat_i = getKSDMatrix(clustlabs = mat7$sample,vec = mat7$value)
+    return(ksd.mat_i)
+  })
+  ksd.mat = Reduce("+",ksd_list)/Nbootstrap
+  
+  ## non-parallel solution
+  # for(i in seq(Nbootstrap)){
+  #   # Create a new balanced dataframe
+  #   balanced_mat7 <- mat7 %>%
+  #     group_by(sample) %>%
+  #     sample_n(min_sample_count, replace = FALSE) %>%
+  #     ungroup()
+  #   
+  #   ksd.mat_i = getKSDMatrix(clustlabs = mat7$sample,vec = mat7$value)
+  #   ksd.mat = ksd.mat + ksd.mat_i
+  # }
+  # ksd.mat = ksd.mat/Nbootstrap
+  
+  idx_ksd = order(ksd.mat["Petropoulos2016",])
+  ksd.mat = ksd.mat[idx_ksd, idx_ksd]
+  
+  
+  
+  
+  # idx.ref = grep("ref", Ref.sample[idx_ksd])
+  idx.ref = which(colnames(ksd.mat) %in% c("Petropoulos2016","Yanagida2021_nat","Xiang2020"))
+  # mat4 = GetRankMatrix(jsd.mat = ksd.mat,idx.ref)
+  mat4 = ksd.mat[,idx.ref]
+  mat4 = reshape2::melt(mat4)
+  mat4$value = round(mat4$value, 2)
+  
+  # mat4 = reshape2::melt(rank.mat[,c(2,3,4,7,5,6,1)])
+  mat4.2 = GetRankMatrix(jsd.mat = ksd.mat, which(colnames(ksd.mat) %in% ref.datasets))
+  mat4.2 %>% group_by(Var1) %>%
+    summarise(value=median(value)) -> mat6
+  mat6$Var2 <- lab_rank
+  mat6$value = round(mat6$value,2)
+  
+  return(list(j=j, ksd.mat=ksd.mat, mat4=mat4, mat6=mat6))
+  
+}
+PlotScore_wrapper_v2 = function(Scores){
+require(tidyverse)
+require(patchwork)
+require(ComplexHeatmap)
+require(circlize)
+# make list of 20 matrices with random size
+M.ls = lapply(seq_along(Scores), function(j){
+  scoredist.ls = ScoreDistance_wrapper_V2(j)
+  M = scoredist.ls$ksd.mat})
+
+# make heatmap and extract grob
+hm_list <- map(seq_along(Scores), function(j){
+  M = M.ls[[j]]
+  Heatmap(M, 
+          name =  substr(Scores[j], 1, nchar(Scores[j])-1),
+          width = ncol(M)*unit(5, "mm"), 
+          height = nrow(M)*unit(5, "mm"),
+          col = colorRamp2(c(0, 0.6), c("greenyellow", "red"))) %>% 
+    draw() %>% 
+    grid.grabExpr()
+})
+
+# Plot all with patchwork wrap_plots
+wrap_plots(hm_list, ncol = 1)
+}
+
+
+```
+
+```{r}
+if(!file.exists("../results/ksd_allscores_allsubsample_results.rds")){
+  
+  # Initialize a parallel cluster
+  require(parallel)
+  cl <- makeCluster(64)
+  
+  ksd_allscores_allsubsample_list = lapply(seq_along(Scores), function(k){
+    mat %>% filter(variable %in% Scores[k]) %>%
+      filter(!is.na(value)) %>%
+      group_by(sample) %>%
+      mutate(value = scale(value)) %>% 
+      dplyr::select(sample, variable, value) -> mat7
+    
+    # Calculate the minimum number of elements per sample
+    min_sample_count <- mat7 %>%
+      group_by(sample) %>%
+      summarise(sample_count = n()) %>%
+      pull(sample_count) %>%
+      min()
+    
+    subsample_vec = c(100, min_sample_count, 400, 800, 1000, 1500)
+    Nbootstrap=1000
+    
+    # Load libraries on each worker
+    clusterEvalQ(cl, library(dplyr))
+    
+    ksd.mat_list = lapply(seq_along(subsample_vec), function(j){
+      
+      # Export data to all workers
+      clusterExport(cl, varlist = c("mat7","subsample_vec","j","getKSDMatrix"))  # Add other variables if needed
+      
+      ksd_list = parLapply(cl, seq(Nbootstrap), function(i){
+        # Create a new balanced dataframe
+        balanced_mat7 <- mat7 %>%
+          group_by(sample) %>%
+          sample_n(subsample_vec[j], replace = TRUE) %>%
+          ungroup()
+        
+        ksd.mat_i = getKSDMatrix(clustlabs = balanced_mat7$sample,vec = balanced_mat7$value)
+        return(ksd.mat_i)
+      })
+      ksd.mat = Reduce("+",ksd_list)/Nbootstrap
+      
+      # idx.ref = grep("ref", Ref.sample[idx_ksd])
+      # idx.ref = which(colnames(ksd.mat) %in% c("Petropoulos2016_ref","Yanagida2021_ref","Xiang2020_ref"))
+      # mat4 = GetRankMatrix(jsd.mat = ksd.mat,idx.ref)
+      # mat4 = ksd.mat[,idx.ref]
+      mat4 = reshape2::melt(ksd.mat)
+      
+      return(mat4)})
+    names(ksd.mat_list) = paste0("subsample_", subsample_vec)
+    
+    return(ksd.mat_list)
+  })
+  names(ksd_allscores_allsubsample_list) = Scores
+  stopCluster(cl)
+  
+  saveRDS(ksd_allscores_allsubsample_list, "../results/ksd_allscores_allsubsample_results.rds")
+}
+```
+
+```{r}
+ksd_allscores_allsubsample_list = readRDS("../results/ksd_allscores_allsubsample_results.rds")
+
+ksd.mat_df_list = lapply(seq_along(ksd_allscores_allsubsample_list), function(j){
+  ksd.mat_list = ksd_allscores_allsubsample_list[[j]]
+
+  ksd.mat_df = do.call("rbind", ksd.mat_list)
+  ksd.mat_df = ksd.mat_df[ksd.mat_df$Var2 %in% c("Petropoulos2016_ref","Yanagida2021_ref","Xiang2020_ref"),]
+  ksd.mat_df$subsample = sapply(strsplit(rownames(ksd.mat_df), split = "[.]"), "[[", 1)
+  
+  require(tidyr)
+  ksd.mat_df_wide <- ksd.mat_df %>%
+    pivot_wider(names_from = subsample, values_from = value) %>%
+    as.data.frame()
+  
+  return(ksd.mat_df_wide)
+})
+names(ksd.mat_df_list) = names(ksd_allscores_allsubsample_list)
+
+```
+
+```{r}
+
+delta_ksd_sub_ls = lapply(ksd.mat_df_list, function(ksd.mat_df){
+  sub_idx = grep("subsample", colnames(ksd.mat_df))
+  ref_idx = sub_idx[2]
+  sub_idx = sub_idx[-2]
+  mse_ksd_sub = ksd.mat_df[,ref_idx] - ksd.mat_df[,sub_idx]
+  return(mse_ksd_sub)
+})
+names(delta_ksd_sub_ls) = names(ksd.mat_df_list)
+
+ksd_sub_df = do.call("rbind", ksd.mat_df_list)
+ksd_sub_df$Score = sapply(strsplit(rownames(ksd_sub_df), split = "[.]"), "[[", 1)
+
+ksd_sub_df_long = reshape2::melt(ksd_sub_df)
+#filter out CTB
+ksd_sub_df_long
+
+pl = ggplot(ksd_sub_df_long, aes(x=Score, y=value))+
+  geom_jitter(aes(color=variable))+
+  geom_boxplot(width=0.1)+
+  theme_bw()+
+  coord_fixed()+
+  coord_flip()+
+  xlab("Phenotype Modules") + ylab("KSD") + ggtitle("KSD Across Subsampling Rates")
+pl
+ggsave("../figures//KSD_sampling_sensitivity_boxplot.png", height = 4, width = 4)
+```
+Some degree of stratification by subsampling rate observed for CTB and AMN. This shows a bias introduced by subsampling.
+
+# In Relation to Smallest Dataset Size
+In our manuscript, we use the smallest dataset size (subsample_122). Here, we show how different subsamping rates compare.
+We look at:
+1. the mean square error (MSE) of the KSD matrix between subsample_122 and other rates.
+2. The differenec of KSDs between subsample_122 and other rates.
+3. The rank correlation between those generated by subsample_122 and other rates.
+
+```{r MSE of KSD matrix}
+
+mse_ksd_sub_ls = lapply(ksd.mat_df_list, function(ksd.mat_df){
+  sub_idx = grep("subsample", colnames(ksd.mat_df))
+  ref_idx = sub_idx[2]
+  sub_idx = sub_idx[-2]
+  mse_ksd_sub = apply(ksd.mat_df[,ref_idx] - ksd.mat_df[,sub_idx], MARGIN = 2, FUN = norm, type = "2")
+  return(mse_ksd_sub)
+})
+names(mse_ksd_sub_ls) = names(ksd.mat_df_list)
+mse_ksd_sub_df = do.call("cbind", mse_ksd_sub_ls)
+
+mse_ksd_sub_df_long = reshape2::melt(mse_ksd_sub_df)
+
+ggplot(mse_ksd_sub_df_long, aes(x=Var2, y=value))+
+  geom_col(aes(fill=Var1), position = "dodge")+
+  # geom_point(aes(color=Var1))+
+  xlab("Phenotype Modules") + ylab("MSE") + 
+  theme_bw()+
+  coord_flip()+
+  plot_annotation(title = "KSD Stability Across Subsampling Rates")
+
+ggsave("../figures/KSD_sampling_sensitivity_barplot.png", height = 4, width = 4)
+```
+
+
+```{r deltaKSD}
+
+delta_ksd_sub_ls = lapply(ksd.mat_df_list, function(ksd.mat_df){
+  sub_idx = grep("subsample", colnames(ksd.mat_df))
+  ref_idx = sub_idx[2]
+  sub_idx = sub_idx[-2]
+  mse_ksd_sub = ksd.mat_df[,ref_idx] - ksd.mat_df[,sub_idx]
+  return(mse_ksd_sub)
+})
+names(delta_ksd_sub_ls) = names(ksd.mat_df_list)
+delta_ksd_sub_df = do.call("rbind", delta_ksd_sub_ls)
+delta_ksd_sub_df$Score = sapply(strsplit(rownames(delta_ksd_sub_df), split = "[.]"), "[[", 1)
+
+
+
+delta_ksd_sub_df_long = reshape2::melt(delta_ksd_sub_df)
+delta_ksd_sub_df_long$Score = factor(delta_ksd_sub_df_long$Score)
+delta_ksd_sub_df_long$Score = fct_inorder(delta_ksd_sub_df_long$Score)
+
+pl = ggplot(delta_ksd_sub_df_long, aes(x=Score, y=value))+
+  geom_jitter(aes(color=variable))+
+  geom_boxplot(width=0.1)+
+  theme_bw()+
+  coord_fixed()+
+  coord_flip()+
+  scale_x_discrete(limits=rev)+
+  xlab("Phenotype Modules") + ylab(expression(Delta~"KSD to subsample_122")) + ggtitle("KSD Stability Across Subsampling Rates")
+pl
+
+ggsave("../figures/KSD_sampling_sensitivity_deltaKSDfromMinSize_boxplot.png", height = 4, width = 4)
+```
+We observe that KSD values decrease as you increase the subsampling rate. We then investigate if there is a change in the order by computing the spearman correlation.
+
+```{r KSD rank correlation}
+
+corr_ksd_sub_ls = lapply(ksd.mat_df_list, function(ksd.mat_df){
+  sub_idx = grep("subsample", colnames(ksd.mat_df))
+  ref_idx = sub_idx[2]
+  sub_idx = sub_idx[-2]
+  mse_ksd_sub = cor(ksd.mat_df[,ref_idx], ksd.mat_df[,sub_idx], method = "spearman")
+  return(mse_ksd_sub)
+})
+names(corr_ksd_sub_ls) = names(ksd.mat_df_list)
+corr_ksd_sub_df = as.data.frame(do.call("rbind", corr_ksd_sub_ls))
+rownames(corr_ksd_sub_df) = corr_ksd_sub_df$Score =names(corr_ksd_sub_ls)
+
+corr_ksd_sub_df_long = reshape2::melt(corr_ksd_sub_df)
+corr_ksd_sub_df_long$Score = factor(corr_ksd_sub_df_long$Score)
+corr_ksd_sub_df_long$Score = fct_inorder(corr_ksd_sub_df_long$Score)
+
+pl = ggplot(corr_ksd_sub_df_long, aes(x=Score, y=value))+
+  geom_boxplot(width=0.1)+
+  geom_point(aes(color=variable))+
+  ylim(0,1)+
+  theme_bw()+
+  coord_fixed()+
+  coord_flip()+
+  scale_x_discrete(limits=rev)+
+  xlab("Phenotype Modules") + ylab(str_wrap("KSD Rank-Correlation to subsample_122", width = 50 )) + ggtitle("KSD Stability Across Subsampling Rates")
+
+pl
+
+ggsave("../figures/KSD_sampling_sensitivity_rank_correlation.png", height = 4, width = 4)
+```
+We observe overall stability in the ranking, with subtly less stable ranking for AMN1.
+
+# Summary
+To ensure the quality of the measured distances, we do the following:
+1. **Normalization and Scaling:** Initially, we normalize the counts within each cell across our datasets. This accounts for variability in sequencing depth and data size. Additionally, we regress out linear dependencies due to variable number of counts or number of features. This is done by fitting a negative binomial linear model described by the aforementioned covariates (See methods section) to the counts. Using the Pearson residuals, we conduct our downstream analysis. Through this, we minimize the effect of sequencing depth variability.
+2. **Subsampling:** The datasets were subsampled by the number of cells in the smallest dataset (Xiang2020_ref; 122 cells) with replacement. The empirical CDF was estimated on the scores of these cells, and KS-test was implemented. By subsampling, we hope to minimize the influence of dataset size variability.
+3. **Bootstrapping:** To increase the stability of our measure, we repeat the subsampling step 1000 times for each Phenotype Module Score. We then take the average KSD of all 1000 repititions for each dataset pair. This increases the reliability of our final measures and ensures the KSD value was not generated by chance due to a specific sample iteration.
+4. **Sensitivity Analysis:** Finally, to assess the robustness of the measure to different subsampling sizes, we subsampled at different rates (n=100, 400, 800, 1000, 1500) with replacement. We follow the same procedure mentioned above, and compute  We then evaluate the measured KSD for the different subsampling rates. Our findings show that while distance values might decrease by increasing subsampling size, the rankings between the distances are preserved.
+
+
+## AMN/CTB Variability Source
+We noticed less stability for AMN and CTB due to varying subsample sizes. Here, we investigate deeper the source of the instability. A quick way to do so is to plot the distance matrix side by side for the different subsampling rates.
+```{r}
+j="AMN1"
+i=1
+ksd.mat_df_ls = ksd_allscores_allsubsample_list[[j]]
+ksd.mat_df = do.call("rbind", ksd.mat_df_ls)
+ksd.mat_df$subsample = sapply(strsplit(rownames(ksd.mat_df), split = "[.]"), "[[", 1)
+ksd.mat_df_long = reshape2::melt(ksd.mat_df)
+ksd.mat_df_long$subsample = fct_inorder(ksd.mat_df_long$subsample)
+ksd.mat_df_long = ksd.mat_df_long %>% group_by(subsample) %>%
+  mutate(value = minmaxNormalization(value)) %>%
+  as.data.frame()
+
+ggplot(ksd.mat_df_long, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  scale_fill_gradient(high = "red", low = "yellowgreen") + 
+  coord_fixed() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  facet_wrap(~subsample)+
+  plot_annotation(title = "KS-Distance Matrices for AMN1 Scores Across Different Subsampling Rates")
+ggsave("../figures/KSD_sampling_sensitivity_AMN_heatmap.png", height = 7, width = 7)
+```
+More resolution is acquired for higher subsampling rates. Specifically, AMN score distances are obscured, and can only conclusively determine that Fan2021 is different from other datasets. For higher subsampling, we recover more signal. 
+
+```{r}
+j="CTB1"
+i=1
+ksd.mat_df_ls = ksd_allscores_allsubsample_list[[j]]
+ksd.mat_df = do.call("rbind", ksd.mat_df_ls)
+ksd.mat_df$subsample = sapply(strsplit(rownames(ksd.mat_df), split = "[.]"), "[[", 1)
+ksd.mat_df_long = reshape2::melt(ksd.mat_df)
+ksd.mat_df_long$subsample = fct_inorder(ksd.mat_df_long$subsample)
+ksd.mat_df_long = ksd.mat_df_long %>% group_by(subsample) %>%
+  mutate(value = minmaxNormalization(value)) %>%
+  as.data.frame()
+
+ggplot(ksd.mat_df_long, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  scale_fill_gradient(high = "red", low = "yellowgreen") + 
+  coord_fixed() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  facet_wrap(~subsample)+
+  plot_annotation(title = "KS-Distance Matrices for CTB1 Scores Across Different Subsampling Rates")
+ggsave("05_analysis/KSD_sampling_sensitivity_CTB_heatmap.png", height = 7, width = 7)
+```
+The same is observed for CTB1; we have better resolution using larger subsample size. There is however a noticeable distance between Xiang2020_ref and other samples. However, this only shows for CTB, making it unlikely that its a consequence of the number of cells in the data, and more plausibly a biological signal.
+
+```{r}
+for(j in Scores){
+ksd.mat_df_ls = ksd_allscores_allsubsample_list[[j]]
+ksd.mat_df = do.call("rbind", ksd.mat_df_ls)
+ksd.mat_df$subsample = sapply(strsplit(rownames(ksd.mat_df), split = "[.]"), "[[", 1)
+ksd.mat_df_long = reshape2::melt(ksd.mat_df)
+ksd.mat_df_long$subsample = fct_inorder(ksd.mat_df_long$subsample)
+ksd.mat_df_long = ksd.mat_df_long %>% group_by(subsample) %>%
+  mutate(value = minmaxNormalization(value)) %>%
+  as.data.frame()
+
+ggplot(ksd.mat_df_long, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  scale_fill_gradient(high = "red", low = "yellowgreen") + 
+  coord_fixed() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  facet_wrap(~subsample)+
+  plot_annotation(title = paste0("KS-Distance Matrices for ",j," Scores Across Different Subsampling Rates"))
+ggsave(paste0("../../05_analysis/figures/score_heatmap/KSD_sampling_sensitivity_",gsub("1","",j),"_heatmap.png"), height = 7, width = 7)
+}
+```
+
+```{r}
+for(j in seq_along(subsample_vec)){
+  for(i in seq_along(Scores)){
+    ksd_allscores_subsample.ls = ksd_allscores_allsubsample_list[[Scores[i]]]
+    ksd.mat_df = ksd_allscores_subsample.ls[[j]]
+    ksd.mat_df_wide = ksd.mat_df %>% pivot_wider(id_cols = Var1, names_from = Var2, values_from = value)
+    
+    require(ComplexHeatmap)
+    require(circlize)
+    svg(filename = paste0("../../05_analysis/figures/ksd_plots/KSD_",Scores[i],"_",subsample_vec[j],"_heatmap.svg"), width = 8, height = 6.5, pointsize = 320)
+    M=as.matrix(ksd.mat_df_wide[,-1])
+    rownames(M) = ksd.mat_df_wide$Var1
+    Heatmap(M, 
+            name =  gsub("1","",paste0(Scores[i],"\nKSD")),
+            width = ncol(M)*unit(10, "mm"), 
+            height = nrow(M)*unit(10, "mm"),
+            # col = colorRamp2(c(0, 1), c("greenyellow", "red"))) %>% 
+            col = colorRamp2(c(min(M), max(M)), c("greenyellow", "red"))) %>% 
+      draw()
+    dev.off()
+  }}
+
+
+# ggplot(ksd.mat_df_long, aes(x=Var1, y=Var2, fill=value))+
+#   geom_tile()+
+#   scale_fill_gradient(high = "red", low = "greenyellow") + 
+#   coord_fixed() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+#         axis.title.x = element_blank(),
+#         axis.title.y = element_blank()) +
+#   plot_annotation(title = paste0(Scores[i]," KSD Heatmap"))
+# ggsave(paste0("05_analysis/ksd_plots/KSD_sampling_sensitivity_",Scores[i],"_heatmap.png"), height = 7, width = 7)
+
+```
+
+
+```{}
+# run the same as top without normalizing for each subsample independently
+j="AMN1"
+i=1
+ksd.mat_df_ls = ksd_allscores_allsubsample_list[[j]]
+ksd.mat_df = do.call("rbind", ksd.mat_df_ls)
+ksd.mat_df$subsample = sapply(strsplit(rownames(ksd.mat_df), split = "[.]"), "[[", 1)
+ksd.mat_df_long = reshape2::melt(ksd.mat_df)
+ksd.mat_df_long$subsample = fct_inorder(ksd.mat_df_long$subsample)
+
+ggplot(ksd.mat_df_long, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  scale_fill_gradient(high = "red", low = "yellowgreen") + 
+  coord_fixed() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  facet_wrap(~subsample)+
+  plot_annotation(title = "KS-Distance Matrices for AMN1 Scores Across Different Subsampling Rates")
+
+j="CTB1"
+i=1
+ksd.mat_df_ls = ksd_allscores_allsubsample_list[[j]]
+ksd.mat_df = do.call("rbind", ksd.mat_df_ls)
+ksd.mat_df$subsample = sapply(strsplit(rownames(ksd.mat_df), split = "[.]"), "[[", 1)
+ksd.mat_df_long = reshape2::melt(ksd.mat_df)
+ksd.mat_df_long$subsample = fct_inorder(ksd.mat_df_long$subsample)
+
+ggplot(ksd.mat_df_long, aes(x=Var1, y=Var2, fill=value))+
+  geom_tile()+
+  scale_fill_gradient(high = "red", low = "yellowgreen") + 
+  coord_fixed() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  facet_wrap(~subsample)+
+  plot_annotation(title = "KS-Distance Matrices for CTB1 Scores Across Different Subsampling Rates")
+
+```
+
+
+
+
+
+
+
+
+

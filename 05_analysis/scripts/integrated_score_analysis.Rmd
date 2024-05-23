@@ -1,0 +1,1382 @@
+---
+title: "integrated_score_analysis"
+author: "Ali Balubaid"
+date: "2024-03-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# set-up
+# knitr::opts_knit$set(root.dir = "/home/balubao/Documents/Research/blastoid_comparison/")
+# setwd('/home/balubao/Documents/Research/blastoid_comparison/')
+source("../../script/Initiation.R")
+```
+
+# Analyze Integrated Data
+
+```{r load data}
+cca_int_obj = readRDS("../../04_integration/results/cca_integrated_blastoid.rds")
+cca_ref_int_obj = readRDS("../../04_integration/results/cca_refpxy_integrated_blastoid.rds")
+rpca_int_obj = readRDS("../../04_integration/results/rpca_kw80_integrated_blastoid.rds")
+rpca_ref_int_obj = readRDS("../../04_integration/results/rpca_refpxy_kw80_integrated_blastoid.rds")
+mnn_int_obj = readRDS("../../04_integration/results/mnn_integrated_blastoid.rds")
+
+load("preintegrated_seurat_obj.rda")
+
+split_obj@reductions[["integrated.cca"]] = cca_int_obj@reductions$integrated.cca
+split_obj@reductions[["integrated.cca_ref"]] = cca_ref_int_obj@reductions$integrated.cca
+split_obj@reductions[["integrated.rpca"]] = rpca_int_obj@reductions$integrated.rpca
+split_obj@reductions[["integrated.rpca_ref"]] = rpca_ref_int_obj@reductions$integrated.rpca
+split_obj@reductions[["integrated.mnn"]] = mnn_int_obj@reductions$integrated.mnn
+
+```
+
+## score-based analysis
+Assign scores and transfer to integrated object
+```{r load and modify}
+seurat.list = readRDS("../../03_annotation/results/annotated_seurat_list_revision_2.rds")
+# preintegrated_seurat_list.rds")
+seurat.list = readRDS("../../03_annotation/results/preintegrated_seurat_list.rds")
+df_ds = data.frame(seurat = c("Petropoulos2016_ref", "Xiang2020_ref", 
+                              "Yanagida2021_ref", "Yanagida2021", "Kagawa2022",
+                              "Fan2021","Lui2021","Sozen2021",
+                              "Yu2021_5iLA","Yu2021_PXGL"), 
+                   tech = c("SS2", "SS2", 
+                              "SS2", "SS2", "SS2",
+                              "10x","10x","10x",
+                              "10x","10x"),
+                   ref = c("ref", "ref", 
+                              "ref", "model", "model",
+                              "model","model","model",
+                              "model","model"))
+seurat.list = lapply(seurat.list, function(seurat.obj){
+  seurat.obj$tech = df_ds$tech[df_ds$seurat %in% unique(seurat.obj$sample)]
+  seurat.obj$ref = df_ds$ref[df_ds$seurat %in% unique(seurat.obj$sample)]
+  return(seurat.obj)
+})
+
+seurat.list = lapply(seurat.list, function(seurat.obj){
+  
+  if(unique(seurat.obj$tech) == "SS2"){
+  newnames = seurat.obj[["RNA"]][[]]$hgnc_symbol
+  newnames[is.na(newnames)] = rownames(seurat.obj)[is.na(newnames)]
+  newnames = make.unique(newnames)
+  rownames(seurat.obj) = newnames
+  return(seurat.obj)}
+  
+  if(unique(seurat.obj$tech)=="10x"){
+  newnames = seurat.obj[["RNA"]][[]]$gene_names
+  newnames[is.na(newnames)] = rownames(seurat.obj)[is.na(newnames)]
+  newnames = make.unique(newnames)
+  rownames(seurat.obj) = newnames
+  return(seurat.obj)}
+})
+
+seurat.list = lapply(seurat.list, function(seurat.obj){
+  tmp = GetAllModules(seurat.obj, assay = "RNA")
+  return(tmp$seurat.object)
+})
+
+tmp_ls = lapply(seurat.list, function(seurat.obj){
+  tmp = GetAllModules(seurat.obj, assay = "RNA")
+  return(tmp)
+})
+
+score_qc.ls = lapply(tmp_ls, "[[", 2)
+score_qc = do.call("rbind",score_qc.ls)
+write.table(round(score_qc, digits = 2), file = "02_preprocessing/ScoreQC_table.csv", sep = ",")
+```
+
+```{r transfer scores to integrated data}
+AllMarkers = GetSCTypeMarkers("Embryo_Sam2")
+
+scores_mat.ls = lapply(seurat.list, function(x){
+  cellnames = colnames(x)
+  scores_mat = cbind(cellnames, x@meta.data[,paste0(names(AllMarkers),"1")])
+  return(scores_mat)
+}) 
+
+scores_mat = do.call("rbind", scores_mat.ls)
+scores_mat$cellnames = make.unique(scores_mat$cellnames)
+split_obj = AddMetaData(split_obj, metadata = scores_mat[,-1])
+
+```
+
+```{r generate plotting data}
+AllMarkers = GetSCTypeMarkers("Embryo_Sam2")
+
+marker_genes = unlist(AllMarkers)
+marker_genes = marker_genes[marker_genes %in% rownames(split_obj)]
+
+plotting.data = cbind(split_obj@meta.data, t(GetAssayData(split_obj, assay = "RNA")[marker_genes,]))
+
+umap_emb = grep("umap", names(split_obj@reductions), value = TRUE)
+for(i in seq_along(umap_emb)){
+  plotting.data = cbind(plotting.data, Embeddings(split_obj, reduction = umap_emb[i]))
+}
+```
+
+```{r}
+plotting.data = readRDS("../../results/plotting_data_revision_2.RDS")
+plotting.data$celltype = plotting.data$annot_major
+```
+
+
+### Qualitative - marker-based analysis
+
+```{r plotting functions}
+
+### marker-based
+figure_marker_umap_preimplantation = function(Scores = as.character(unlist(AllMarkers[seq(1,3)]))){
+  Scores = Scores[Scores %in% colnames(plotting.data)] #filter
+  df1 = plotting.data %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(sample, variable) %>%
+    mutate(value=minmaxNormalization(value))
+  
+  df1$sample = factor(df1$sample)
+  df1$sample = fct_inorder(df1$sample)
+  # df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  df1 <- df1 %>%
+    group_by(sample) %>%
+    sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct()  # Remove duplicates
+  
+  p1 = 
+    ggplot()+
+    geom_point(data = df1 %>% arrange(value), aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    # geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(size=0.5)+
+    theme_minimal()+
+    theme(legend.position = "b", 
+          text = element_text(),
+          axis.ticks = element_blank(),
+          axis.text = element_blank())+
+    scale_color_viridis_c(option = "viridis")+facet_grid(sample~variable)
+  
+  df1 %>% filter(is.na(value)==FALSE) %>%  arrange(value) -> df2
+  df1 %>% filter(is.na(value)==TRUE) -> df3
+  p2 = 
+    ggplot()+
+    geom_point(data = df3, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    # geom_point(df1 %>% arrange(is.na(value)) %>%  arrange(value),
+    #            aes_string(x='UMAP_1',y='UMAP_2',col='value'), size=0.5)+
+    theme_minimal()+
+    theme(legend.position = "none", 
+          text = element_text(),
+          axis.ticks = element_blank(),
+          axis.text = element_blank())+
+    scale_color_viridis_c(option = "viridis")+
+    facet_wrap(~variable, nrow=1)
+  # p2
+  wrap_plots(list(p2,p1), heights = c(1,10))
+}
+figure_marker_umap_postimplantation_a = function(Scores = as.character(unlist(AllMarkers[seq(4,5)]))){
+  Scores = Scores[Scores %in% colnames(plotting.data)] #filter
+  df1 = plotting.data %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(sample, variable) %>%
+    mutate(value=minmaxNormalization(value))
+  
+  df1$sample = factor(df1$sample)
+  df1$sample = fct_inorder(df1$sample)
+  # df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  df1 <- df1 %>%
+    group_by(sample) %>%
+    sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct()  # Remove duplicates
+  
+  p1 = 
+    ggplot()+
+    geom_point(data = df1 %>% arrange(value), aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    # geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(size=0.5)+
+    theme_minimal()+
+    theme(legend.position = "none", text = element_text(size=5))+
+    scale_color_viridis_c(option = "viridis")+facet_grid(sample~variable)
+  
+  df1 %>% filter(is.na(value)==FALSE) %>%  arrange(value) -> df2
+  df1 %>% filter(is.na(value)==TRUE) -> df3
+  p2 = 
+    ggplot()+
+    geom_point(data = df3, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    # geom_point(df1 %>% arrange(is.na(value)) %>%  arrange(value),
+    #            aes_string(x='UMAP_1',y='UMAP_2',col='value'), size=0.5)+
+    theme_minimal()+
+    theme(legend.position = "none", text = element_text(size=5))+
+    scale_color_viridis_c(option = "viridis")+
+    facet_wrap(~variable, nrow=1)
+  # p2
+  wrap_plots(list(p2,p1), heights = c(1,10))
+}
+figure_marker_umap_postimplantation_b = function(Scores = as.character(unlist(AllMarkers[seq(6,7)]))){
+  Scores = Scores[Scores %in% colnames(plotting.data)] #filter
+  df1 = plotting.data %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(sample, variable) %>%
+    mutate(value=minmaxNormalization(value))
+  
+  df1$sample = factor(df1$sample)
+  df1$sample = fct_inorder(df1$sample)
+  # df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  df1 <- df1 %>%
+    group_by(sample) %>%
+    sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct()  # Remove duplicates
+  
+  p1 = 
+    ggplot()+
+    geom_point(data = df1 %>% arrange(value), aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    # geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(size=0.5)+
+    theme_minimal()+
+    theme(legend.position = "none", text = element_text(size=5))+
+    scale_color_viridis_c(option = "viridis")+facet_grid(sample~variable)
+  
+  df1 %>% filter(is.na(value)==FALSE) %>%  arrange(value) -> df2
+  df1 %>% filter(is.na(value)==TRUE) -> df3
+  p2 = 
+    ggplot()+
+    geom_point(data = df3, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    # geom_point(df1 %>% arrange(is.na(value)) %>%  arrange(value),
+    #            aes_string(x='UMAP_1',y='UMAP_2',col='value'), size=0.5)+
+    theme_minimal()+
+    theme(legend.position = "none", text = element_text(size=5))+
+    scale_color_viridis_c(option = "viridis")+
+    facet_wrap(~variable, nrow=1)
+  # p2
+  wrap_plots(list(p2,p1), heights = c(1,10))
+}
+
+#### Score pre-implantation
+figure_qualitative_umap_preimplantation = function(Scores = c("EPI_ICM1","PE1","TE1")){
+df1 = plotting.data %>%
+  dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+  group_by(sample, variable) %>%
+  mutate(value=minmaxNormalization(value))
+# levels(df1$variable) =
+df1$variable = str_sub(df1$variable, end = -2)
+  
+df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+df1 <- df1 %>%
+  group_by(sample) %>%
+  sample_n(size = 5000, replace = TRUE) %>%
+  ungroup() %>%
+  distinct()  # Remove duplicates
+
+p1 = ggplot(df1 %>% arrange(get("value")),
+       aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+  geom_point(size=0.5)+
+  theme_minimal()+
+  theme(legend.position = "none")+
+  scale_color_viridis_c(option = "magma")+facet_grid(sample~variable)
+
+p2 = ggplot(df1 %>% arrange(get("value")),
+            aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+  geom_point(size=0.5)+
+  theme_minimal()+
+  theme(legend.position = "none")+
+  scale_color_viridis_c(option = "magma")+
+  facet_wrap(~variable, nrow=1)
+
+wrap_plots(list(p2,p1), heights = c(1,10))
+
+}
+figure_qualitative_umap_preimplantation_raw = function(Scores = c("EPI_ICM1","PE1","TE1")){
+  df1 = plotting.data %>%
+  dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(sample) %>%
+    mutate(value=minmaxNormalization(value))
+  df1$variable = str_sub(df1$variable, end = -2)
+  
+  df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  df1 <- df1 %>%
+    group_by(sample) %>%
+    sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct()  # Remove duplicates
+  p1 = ggplot(df1 %>% arrange(get("value")),
+              aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+    geom_point(size=0.5)+
+    theme_minimal()+
+    theme(legend.position = "none")+
+    scale_color_viridis_c(option = "magma")+facet_grid(sample~variable)
+  
+  p2 = ggplot(df1 %>% arrange(get("value")),
+              aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+    geom_point(size=0.5)+
+    theme_minimal()+
+    theme(legend.position = "none")+
+    scale_color_viridis_c(option = "magma")+
+    facet_wrap(~variable, nrow=1)
+  
+  wrap_plots(list(p2,p1), heights = c(1,10))
+  
+}
+
+### Score post-implantation
+figure_qualitative_umap_postimplantation = function(Scores = c("AMN1","EVT1","CTB1","STB1")){
+  df1 = plotting.data %>%
+  dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(sample, variable) %>%
+    mutate(value=minmaxNormalization(value))
+  df1$variable = str_sub(df1$variable, end = -2)
+  
+  df1$sample = factor(df1$sample)
+  df1$sample = fct_inorder(df1$sample)
+  # df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  df1 <- df1 %>%
+    group_by(sample) %>%
+    sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct()  # Remove duplicates
+  
+  p1 = 
+    ggplot()+
+    geom_point(data = df1 %>% arrange(value), aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    # geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(size=0.5)+
+    theme_minimal()+
+    theme(legend.position = "none")+
+    scale_color_viridis_c(option = "magma")+facet_grid(sample~variable)
+  
+  df1 %>% filter(is.na(value)==FALSE) %>%  arrange(value) -> df2
+  df1 %>% filter(is.na(value)==TRUE) -> df3
+  p2 = 
+    ggplot()+
+    geom_point(data = df3, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    # geom_point(df1 %>% arrange(is.na(value)) %>%  arrange(value),
+    #            aes_string(x='UMAP_1',y='UMAP_2',col='value'), size=0.5)+
+    theme_minimal()+
+    theme(legend.position = "none")+
+    scale_color_viridis_c(option = "magma")+
+    facet_wrap(~variable, nrow=1)
+  # p2
+  wrap_plots(list(p2,p1), heights = c(1,10))
+}
+figure_qualitative_umap_postimplantation_raw = function(Scores = c("AMN1","EVT1","CTB1","STB1")){
+  df1 = plotting.data %>%
+  dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(sample) %>%
+    mutate(value=minmaxNormalization(value))
+  df1$variable = str_sub(df1$variable, end = -2)
+  
+  df1$sample = factor(df1$sample)
+  df1$sample = fct_inorder(df1$sample)
+  # df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  df1 <- df1 %>%
+    group_by(sample) %>%
+    sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct()  # Remove duplicates
+  
+  p1 = 
+    ggplot()+
+    geom_point(data = df1 %>% arrange(value), aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    # geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(size=0.5)+
+    theme_minimal()+
+    theme(legend.position = "none")+
+    scale_color_viridis_c(option = "magma")+facet_grid(sample~variable)
+  
+  df1 %>% filter(is.na(value)==FALSE) %>%  arrange(value) -> df2
+  df1 %>% filter(is.na(value)==TRUE) -> df3
+  p2 = 
+    ggplot()+
+    geom_point(data = df3, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+    # geom_point(df1 %>% arrange(is.na(value)) %>%  arrange(value),
+    #            aes_string(x='UMAP_1',y='UMAP_2',col='value'), size=0.5)+
+    theme_minimal()+
+    theme(legend.position = "none")+
+    scale_color_viridis_c(option = "magma")+
+    facet_wrap(~variable, nrow=1)
+  
+  wrap_plots(list(p2,p1), heights = c(1,10), ncol = 1)
+}
+
+```
+
+```{r}
+vec_int = c("cca", "cca_ref", "rpca", "rpca_ref", "mnn", "harmony")
+
+i=3
+for(i in seq_along(vec_int)){
+  int_method = vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+  umaplab1 = paste0("umap",gsub("_","",int_method),"_1")
+  umaplab2 = paste0("umap",gsub("_","",int_method),"_2")
+  
+  plotting.data$cluster = plotting.data[[cluster_column]]
+  plotting.data$UMAP_1 = plotting.data[[umaplab1]]
+  plotting.data$UMAP_2 = plotting.data[[umaplab2]]
+  
+  for(j in seq(3)){
+    marker_genes = as.character(unlist(AllMarkers[j]))
+    marker_genes = marker_genes[marker_genes %in% colnames(plotting.data)]
+    fig_width = length(marker_genes)*1.75
+    figure_marker_umap_preimplantation(Scores = marker_genes)
+    ggsave(paste0("../figures/marker_pre/marker_preimplantation_",names(AllMarkers)[j],"_",int_method,"_umap.png"), width=fig_width, height=16)
+    # ggsave(paste0("../05_analysis/marker_analysis/marker_preimplantation_",int_method,"_umap.png"), units="cm", width=16, height=12.8, dpi = "retina")
+    
+  }
+  
+  for(j in seq(4,7)){
+    marker_genes = as.character(unlist(AllMarkers[j]))
+    marker_genes = marker_genes[marker_genes %in% colnames(plotting.data)]
+    fig_width = length(marker_genes)*1.75
+    figure_marker_umap_preimplantation(Scores = marker_genes)
+    ggsave(paste0("../figures/marker_post/marker_postimplantation_",names(AllMarkers)[j],"_",int_method,"_umap.png"), width=fig_width, height=16)
+    # ggsave(paste0("../05_analysis/marker_analysis/marker_preimplantation_",int_method,"_umap.png"), units="cm", width=16, height=12.8, dpi = "retina")
+    
+  }
+}
+
+# figure_marker_umap_postimplantation_a()
+# ggsave(paste0("05_analysis/marker_post/marker_postimplantation_a_",int_method,"_umap.png"), width=22.75, height=12)
+# ggsave(paste0("05_analysis/marker_analysis/marker_postimplantation_a_",int_method,"_umap.png"), units="cm", width=24, height=12.8, dpi = "retina")
+
+# figure_marker_umap_postimplantation_b()
+# ggsave(paste0("05_analysis/marker_post/marker_postimplantation_b_",int_method,"_umap.png"), width=24.5, height=12)
+# ggsave(paste0("05_analysis/marker_analysis/marker_postimplantation_b_",int_method,"_umap.png"), units="cm", width=24, height=12.8, dpi = "retina")
+
+```
+
+### Qualitative - score-based analysis
+
+```{r}
+
+for(i in seq_along(vec_int)){
+  int_method = vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+  umaplab1 = paste0("umap",gsub("_","",int_method),"_1")
+  umaplab2 = paste0("umap",gsub("_","",int_method),"_2")
+  
+  plotting.data$cluster = plotting.data[[cluster_column]]
+  plotting.data$UMAP_1 = plotting.data[[umaplab1]]
+  plotting.data$UMAP_2 = plotting.data[[umaplab2]]
+  
+  figure_qualitative_umap_preimplantation()
+  ggsave(paste0("../figures/score_preimp/qualitative_preimplantation_",int_method,"_umap.png"), width=5.25, height=16)
+  # ggsave(paste0("../05_analysis/score_preimp/qualitative_preimplantation_",int_method,"_umap.svg"), units="cm", width=14, height=40, dpi = "retina")
+  
+  figure_qualitative_umap_preimplantation_raw()
+  ggsave(paste0("../figures/score_preimp/qualitative_preimplantation_",int_method,"_umap_raw.png"), width=5.25, height=16)
+  # ggsave(paste0("../05_analysis/score_preimp/qualitative_preimplantation_",int_method,"_umap_raw.svg"), units="cm", width=14, height=40, dpi = "retina")
+}
+```
+
+```{r}
+
+
+for(i in seq_along(vec_int)){
+  int_method = vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+  umaplab1 = paste0("umap",gsub("_","",int_method),"_1")
+  umaplab2 = paste0("umap",gsub("_","",int_method),"_2")
+  
+  plotting.data$cluster = plotting.data[[cluster_column]]
+  plotting.data$UMAP_1 = plotting.data[[umaplab1]]
+  plotting.data$UMAP_2 = plotting.data[[umaplab2]]
+  
+  figure_qualitative_umap_postimplantation()
+  ggsave(paste0("../figures/score_post/qualitative_postimplantation_",int_method,"_umap.png"), width=7, height=16)
+  # ggsave(paste0("../05_analysis/score_post/qualitative_postimplantation_",int_method,"_umap.svg"), units="cm", width=18, height=40, dpi = "retina")
+  
+  
+  figure_qualitative_umap_postimplantation_raw()
+  ggsave(paste0("../figures/score_post/qualitative_postimplantation_",int_method,"_umap_raw.png"), width=7, height=16)
+  # ggsave(paste0("../05_analysis/score_post/qualitative_postimplantation_",int_method,"_umap_raw.svg"), units="cm", width=18, height=40, dpi = "retina")
+}
+```
+
+### Quantitative - score-based analysis
+We thoroughly explore the results in KSD supplementary file.
+```{r load data}
+ksd_allscores_allsubsample_list = readRDS("ksd_allscores_allsubsample_results.rds")
+
+ksd.mat_df_list = lapply(seq_along(ksd_allscores_allsubsample_list), function(j){
+  ksd.mat_list = ksd_allscores_allsubsample_list[[j]]
+
+  ksd.mat_df = do.call("rbind", ksd.mat_list)
+  ksd.mat_df = ksd.mat_df[ksd.mat_df$Var2 %in% c("Petropoulos2016_ref","Yanagida2021_ref","Xiang2020_ref"),]
+  ksd.mat_df$subsample = sapply(strsplit(rownames(ksd.mat_df), split = "[.]"), "[[", 1)
+  
+  require(tidyr)
+  ksd.mat_df_wide <- ksd.mat_df %>%
+    pivot_wider(names_from = subsample, values_from = value) %>%
+    as.data.frame()
+  
+  return(ksd.mat_df_wide)
+})
+names(ksd.mat_df_list) = names(ksd_allscores_allsubsample_list)
+
+```
+
+```{r}
+Scores = c("EPI_ICM1", "PE1", "TE1")
+
+ksd_allscores_minSize.ls = lapply(ksd_allscores_allsubsample_list, function(x) x$subsample_122)
+
+ksd.mat_df_ls = ksd_allscores_allsubsample_list[[j]]
+ksd.mat_df = do.call("rbind", ksd.mat_df_ls)
+ksd.mat_df$subsample = sapply(strsplit(rownames(ksd.mat_df), split = "[.]"), "[[", 1)
+
+# distnace metric for robust heirarichal clustering
+  robust_dist = function(x, y) {
+    qx = quantile(x, c(0.1, 0.9))
+    qy = quantile(y, c(0.1, 0.9))
+    l = x > qx[1] & x < qx[2] & y > qy[1] & y < qy[2]
+    x = x[l]
+    y = y[l]
+    sqrt(sum((x - y)^2))
+  }
+  
+for(i in seq_along(Scores)){
+  ksd.mat_df = ksd_allscores_minSize.ls[[Scores[i]]]
+  ksd.mat_df_wide = ksd.mat_df %>% pivot_wider(id_cols = Var1, names_from = Var2, values_from = value)
+  
+  require(ComplexHeatmap)
+  require(circlize)
+  svg(filename = paste0("../figures/ksd_plots/KSD_",Scores[i],"_minsize_heatmap_annot.svg"), width = 8, height = 6.5, pointsize = 320)
+  M=as.matrix(ksd.mat_df_wide[,-1])
+  rownames(M) = ksd.mat_df_wide$Var1
+  row_ha = rowAnnotation(score = anno_density(M,type = "violin"), 
+                         annotation_label = c(""))
+  Heatmap(M, 
+          name =  gsub("1","",paste0(Scores[i],"\nKSD")),
+          width = ncol(M)*unit(5, "mm"), 
+          height = nrow(M)*unit(5, "mm"),
+          right_annotation = row_ha,
+          row_title = NULL,
+          clustering_distance_rows = robust_dist,
+          clustering_distance_columns = robust_dist,
+          # col = colorRamp2(c(0, 1), c("greenyellow", "red"))) %>% 
+          col = colorRamp2(c(min(M), max(M)), c("greenyellow", "red"))) %>% 
+    draw()
+  # Heatmap(M, 
+  #         name =  gsub("1","",paste0(Scores[i],"\nKSD")),
+  #         width = ncol(M)*unit(10, "mm"), 
+  #         height = nrow(M)*unit(10, "mm"),
+  #         # col = colorRamp2(c(0, 1), c("greenyellow", "red"))) %>% 
+  #         col = colorRamp2(c(min(M), max(M)), c("greenyellow", "red"))) %>% 
+  #   draw()
+  dev.off()
+}
+
+
+
+# ggplot(ksd.mat_df_long, aes(x=Var1, y=Var2, fill=value))+
+#   geom_tile()+
+#   scale_fill_gradient(high = "red", low = "greenyellow") + 
+#   coord_fixed() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+#         axis.title.x = element_blank(),
+#         axis.title.y = element_blank()) +
+#   plot_annotation(title = paste0(Scores[i]," KSD Heatmap"))
+# ggsave(paste0("05_analysis/ksd_plots/KSD_sampling_sensitivity_",Scores[i],"_heatmap.png"), height = 7, width = 7)
+
+```
+
+```{r load function}
+plot_score_umap = function(Scores){
+  int_method = vec_int[3]
+  cluster_column <- paste0(int_method, "_clusters")
+  umaplab1 = paste0("umap",gsub("_","",int_method),"_1")
+  umaplab2 = paste0("umap",gsub("_","",int_method),"_2")
+  
+  plotting.data$cluster = plotting.data[[cluster_column]]
+  plotting.data$UMAP_1 = plotting.data[[umaplab1]]
+  plotting.data$UMAP_2 = plotting.data[[umaplab2]]
+  
+  ############
+  df1 = plotting.data %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(sample, variable) %>%
+    mutate(value=minmaxNormalization(value))
+    # ungroup(sample, variable) %>%
+    # mutate(UMAP_1 = minmaxNormalization(UMAP_1), 
+    #        UMAP_2 = minmaxNormalization(UMAP_2))
+  # levels(df1$variable) =
+  df1$variable = str_sub(df1$variable, end = -2)
+  
+  df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  # df1 <- df1 %>%
+  #   group_by(sample) %>%
+  #   sample_n(size = 5000, replace = TRUE) %>%
+  #   ungroup() %>%
+  #   distinct()  # Remove duplicates
+  
+  p1 = ggplot(df1 %>% arrange(get("value")),
+              aes(x=UMAP_1,y=UMAP_2,col=value))+
+    geom_point(size=0.5)+
+    ylim(-7.5,7.5) + xlim(-9,9) +
+    theme_minimal()+
+    theme(legend.position = "none", 
+          axis.text = element_blank(), 
+          axis.title = element_blank())+
+    scale_color_viridis_c(option = "magma")+
+    facet_wrap(~sample)
+  
+  plts1 = lapply(unique(df1$sample), function(sampledata) {
+    df1 %>% 
+      filter(sample == sampledata) %>% arrange(get("value")) %>%
+      ggplot(aes(x=UMAP_1,y=UMAP_2,col=value))+
+      geom_point(size=0.5)+
+      ylim(-7.5,7.5) + xlim(-9,9) +
+      theme_minimal()+
+      theme(legend.position = "none", 
+            axis.text = element_blank(), 
+            axis.title = element_blank(), title = element_text(size = 7))+
+      scale_color_viridis_c(option = "magma")+
+      ggtitle(sampledata)-> p1
+    return(p1)
+  })
+  
+  p2 = ggplot(df1 %>% arrange(value),
+              aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+    geom_point(size=0.5)+
+    theme_minimal()+
+    ggtitle(Scores)+
+    theme(legend.position = "none", 
+          axis.text = element_blank(), 
+          axis.title = element_blank(), title = element_text(size=8))+
+    scale_color_viridis_c(option = "magma")
+  # facet_wrap(~variable)
+  # wrap_plots(c(list(p2),plts1))
+  
+  # normalized
+  p3 = arrangeGrob(
+    arrangeGrob(p2,
+                do.call(arrangeGrob, c(c(list(NULL,NULL),plts1[1:2]), ncol=2)),
+                nrow=1,
+                widths=c(1,1)),
+    do.call(arrangeGrob, c(plts1[3:10], nrow=2, list(widths=c(1,1,1,1)))),
+    nrow=2, heights=c(1,1))
+  
+  return(p3)
+}
+```
+
+```{r}
+Scores = c("EPI_ICM1", "PE1", "TE1")
+int_method = vec_int[i]
+cluster_column <- paste0(int_method, "_clusters")
+
+plotting.data$cluster = plotting.data[[cluster_column]]
+
+df1 = plotting.data %>%
+  dplyr::select(cluster, sample, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample")) 
+
+df1$variable = str_sub(df1$variable, end = -2)
+
+color_choices = c( "#F8766D", "#00BA38", "#619CFF")
+plts = lapply(seq_along(unique(df1$variable)), function(i) {
+  df1 %>% group_by(sample, variable) %>%
+    # summarise(value = stats::quantile(value, probs = 0.25)) %>%
+    summarise(value = stats::quantile(value, probs = 0.5)) %>%
+    # summarise(value = stats::quantile(value, probs = 0.75)) %>%
+    # summarise(value = diff(stats::quantile(value, probs = c(0.25, 0.75)))) %>%
+    filter(variable == unique(df1$variable)[i]) %>%
+    arrange(value) -> df2
+  
+  df1$sample = factor(df1$sample, levels = df2$sample)
+  
+  df1 %>% filter(variable == unique(df1$variable)[i]) %>%
+    ggplot(aes(x=sample,y=value))+
+    geom_violin(aes(fill=variable), scale = "width")+
+    # stat_summary(fun=median, geom="point", shape=23, size=2) +
+    geom_boxplot(width = 0.1, outliers = FALSE)+
+    theme_minimal()+
+    theme(legend.position = "none", 
+          axis.title.y = element_blank(),
+          axis.title.x = element_blank())+
+    ggtitle(unique(df1$variable)[i])+
+    scale_fill_manual(values=color_choices[i])+
+    coord_flip()-> p1
+  return(p1)
+})
+
+wrap_plots(plts, ncol = 1)
+ggsave("../figures/score_preimp/qualitative_preimplantation_violin.png", height = 10, width = 4)
+
+
+plts = lapply(seq_along(unique(df1$variable)), function(i) {
+  df1 %>% group_by(sample, variable) %>%
+    # summarise(value = stats::quantile(value, probs = 0.25)) %>%
+    summarise(value = stats::quantile(value, probs = 0.5)) %>%
+    # summarise(value = stats::quantile(value, probs = 0.75)) %>%
+    # summarise(value = diff(stats::quantile(value, probs = c(0.25, 0.75)))) %>%
+    filter(variable == unique(df1$variable)[i]) %>%
+    arrange(value) -> df2
+  
+  df1$sample = factor(df1$sample, levels = df2$sample)
+  
+  df1 %>% filter(variable == unique(df1$variable)[i]) %>%
+    ggplot(aes(x=sample,y=value))+
+    geom_violin(aes(fill=variable), scale = "width")+
+    # stat_summary(fun=median, geom="point", shape=23, size=2) +
+    geom_boxplot(width = 0.1, outliers = FALSE)+
+    theme_minimal()+
+    theme(legend.position = "none", 
+          axis.title.y = element_blank(),
+          axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 6.5))+
+    ggtitle(unique(df1$variable)[i])+
+    scale_fill_manual(values=color_choices[i])-> p1
+  return(p1)
+})
+
+wrap_plots(plts, nrow = 1)
+ggsave("../figures/score_preimp/qualitative_preimplantation_violin_horz.png", width = 10, height = 4)
+
+p1 = plot_score_umap(Scores = "EPI_ICM1")
+p2 = plot_score_umap(Scores = "PE1")
+p3 = plot_score_umap(Scores = "TE1")
+
+g1 = arrangeGrob(p1,p2,p3, nrow = 1)
+ggsave("../figures/score_preimp/qualitative_preimplantation_rpca_umap_v2.png", g1, width = 15, height = 5)
+
+g1 = arrangeGrob(p1,p2,p3, ncol = 1)
+ggsave("../figures/score_preimp/qualitative_preimplantation_rpca_umap_v2_vert.png", g1, height = 15, width = 5)
+```
+
+```{r}
+Scores = c("EPI_ICM1", "PE1", "TE1")
+int_method = vec_int[i]
+cluster_column <- paste0(int_method, "_clusters")
+
+plotting.data$cluster = plotting.data[[cluster_column]]
+color_choices = c( "#F8766D", "#00BA38", "#619CFF")
+
+ksd_allscores_minSize.ls = lapply(ksd_allscores_allsubsample_list, function(x) x$subsample_122)
+
+ksd.mat_df_ls = ksd_allscores_allsubsample_list[[j]]
+ksd.mat_df = do.call("rbind", ksd.mat_df_ls)
+ksd.mat_df$subsample = sapply(strsplit(rownames(ksd.mat_df), split = "[.]"), "[[", 1)
+
+# for(i in seq_along(Scores)){
+ksd.mat_df = ksd_allscores_minSize.ls[[Scores[i]]]
+ksd.mat_df_wide = ksd.mat_df %>% pivot_wider(id_cols = Var1, names_from = Var2, values_from = value)
+
+hc_ksd = hclust(dist(ksd.mat_df_wide[,-1]))
+
+df1 %>% group_by(sample, variable) %>%
+  # summarise(value = stats::quantile(value, probs = 0.25)) %>%
+  summarise(value = stats::quantile(value, probs = 0.5)) %>%
+  # summarise(value = stats::quantile(value, probs = 0.75)) %>%
+  # summarise(value = diff(stats::quantile(value, probs = c(0.25, 0.75)))) %>%
+  filter(variable == unique(df1$variable)[i]) %>%
+  arrange(value) -> df2
+
+df1$sample = factor(df1$sample, levels = ksd.mat_df_wide$Var1[hc_ksd$order])
+
+df1 %>% filter(variable == unique(df1$variable)[i]) %>%
+  ggplot(aes(x=sample,y=value))+
+  geom_violin(aes(fill=variable), scale = "width")+
+  # stat_summary(fun=median, geom="point", shape=23, size=2) +
+  geom_boxplot(width = 0.1, outliers = FALSE)+
+  theme_minimal()+
+  theme(legend.position = "none", 
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(),
+        plot.margin = margin(1,1,3,1.2, "cm"))+
+  ggtitle(unique(df1$variable)[i])+
+  scale_fill_manual(values=color_choices[i])+
+  coord_flip()-> p1
+
+p1
+
+p2 = pheatmap::pheatmap(M, color = colorRampPalette(c("greenyellow", "red"))(100))
+
+grid.arrange(p2[[4]],p1, nrow = 1, widths = c(2, 1))
+
+g1 = arrangeGrob(p1,p2[[4]], nrow = 1)
+
+Scores = c("EPI_ICM1", "PE1", "TE1")
+int_method = vec_int[i]
+cluster_column <- paste0(int_method, "_clusters")
+
+plotting.data$cluster = plotting.data[[cluster_column]]
+
+df1 = plotting.data %>%
+  dplyr::select(cluster, sample, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample")) 
+
+df1$variable = str_sub(df1$variable, end = -2)
+```
+
+```{r}
+
+Scores = c("EPI_ICM1", "PE1", "TE1", "AMN1", "CTB1", "EVT1", "STB1")
+
+for(i in seq_along(Scores)){
+  ksd_allscores_minSize.ls = lapply(ksd_allscores_allsubsample_list, function(x) x$subsample_122)
+  
+  ksd.mat_df_ls = ksd_allscores_allsubsample_list[[j]]
+  ksd.mat_df = do.call("rbind", ksd.mat_df_ls)
+  ksd.mat_df$subsample = sapply(strsplit(rownames(ksd.mat_df), split = "[.]"), "[[", 1)
+  
+  # for(i in seq_along(Scores)){
+  ksd.mat_df = ksd_allscores_minSize.ls[[Scores[i]]]
+  ksd.mat_df_wide = ksd.mat_df %>% pivot_wider(id_cols = Var1, names_from = Var2, values_from = value)
+  
+  require(ComplexHeatmap)
+  require(circlize)
+  svg(filename = paste0("05_analysis/ksd_plots/KSD_",Scores[i],"_minsize_heatmap.svg"), width = 8, height = 6.5, pointsize = 320)
+  M=as.matrix(ksd.mat_df_wide[,-1])
+  rownames(M) = ksd.mat_df_wide$Var1
+  row_ha = rowAnnotation(score = anno_density(M))
+  # , type = "violin", 
+  # gp = gpar(fill = 1:10)))
+  Heatmap(M, 
+          name =  gsub("1","",paste0(Scores[i],"\nKSD")),
+          width = ncol(M)*unit(10, "mm"), 
+          height = nrow(M)*unit(10, "mm"),
+          right_annotation = row_ha,
+          # col = colorRamp2(c(0, 1), c("greenyellow", "red"))) %>% 
+          col = colorRamp2(c(min(M), max(M)), c("greenyellow", "red"))) %>% 
+    draw()
+  dev.off()
+}
+```
+
+
+
+
+
+```{r}
+Scores = c("AMN1", "CTB1", "EVT1", "STB1")
+int_method = vec_int[i]
+cluster_column <- paste0(int_method, "_clusters")
+
+plotting.data$cluster = plotting.data[[cluster_column]]
+
+df1 = plotting.data %>%
+  dplyr::select(cluster, sample, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample")) 
+
+df1$variable = str_sub(df1$variable, end = -2)
+
+library(scales)
+color_choices = hue_pal()(length(Scores))
+plts = lapply(seq_along(unique(df1$variable)), function(i) {
+  df1 %>% group_by(sample, variable) %>%
+    # summarise(value = stats::quantile(value, probs = 0.25)) %>%
+    summarise(value = stats::quantile(value, probs = 0.5)) %>%
+    # summarise(value = stats::quantile(value, probs = 0.75)) %>%
+    # summarise(value = diff(stats::quantile(value, probs = c(0.25, 0.75)))) %>%
+    filter(variable == unique(df1$variable)[i]) %>%
+    arrange(value) -> df2
+  
+  df1$sample = factor(df1$sample, levels = df2$sample)
+  
+  df1 %>% filter(variable == unique(df1$variable)[i]) %>%
+    ggplot(aes(x=sample,y=value))+
+    geom_violin(aes(fill=variable), scale = "width")+
+    # stat_summary(fun=median, geom="point", shape=23, size=2) +
+    geom_boxplot(width = 0.1, outliers = FALSE)+
+    theme_minimal()+
+    theme(legend.position = "none", 
+          axis.title.y = element_blank(),
+          axis.title.x = element_blank())+
+    ggtitle(unique(df1$variable)[i])+
+    scale_fill_manual(values=color_choices[i])+
+    coord_flip()-> p1
+  return(p1)
+})
+
+wrap_plots(plts, ncol = 1)
+ggsave("../figures/score_post/qualitative_postimplantation_violin.png", height = 14, width = 5)
+
+p1 = plot_score_umap(Scores = Scores[1])
+p2 = plot_score_umap(Scores = Scores[2])
+p3 = plot_score_umap(Scores = Scores[3])
+p4 = plot_score_umap(Scores = Scores[4])
+
+g1 = arrangeGrob(p1,p2,p3,p4, nrow = 1)
+ggsave("../figures/score_post/qualitative_postimplantation_rpca_umap_v2.png", g1, width = 20, height = 5)
+
+g1 = arrangeGrob(p1,p2, nrow = 1)
+ggsave("../figures/score_post/qualitative_postimplantation_rpca_umap_a_v2.png", g1, width = 10, height = 5)
+
+g2 = arrangeGrob(p3,p4, nrow = 1)
+ggsave("../figures/score_post/qualitative_postimplantation_rpca_umap_b_v2.png", g2, width = 10, height = 5)
+```
+
+
+
+
+```{r}
+# figure_qualitative_umap_preimplantation = function(Scores = c("EPI_ICM1","PE1","TE1")){
+  
+  Scores = "EPI_ICM1"
+plot_score_umap = function(Scores){
+  int_method = vec_int[3]
+  cluster_column <- paste0(int_method, "_clusters")
+  umaplab1 = paste0("umap",gsub("_","",int_method),"_1")
+  umaplab2 = paste0("umap",gsub("_","",int_method),"_2")
+  
+  plotting.data$cluster = plotting.data[[cluster_column]]
+  plotting.data$UMAP_1 = plotting.data[[umaplab1]]
+  plotting.data$UMAP_2 = plotting.data[[umaplab2]]
+  
+  ############
+  df1 = plotting.data %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(sample, variable) %>%
+    mutate(value=minmaxNormalization(value))
+    # ungroup(sample, variable) %>%
+    # mutate(UMAP_1 = minmaxNormalization(UMAP_1), 
+    #        UMAP_2 = minmaxNormalization(UMAP_2))
+  # levels(df1$variable) =
+  df1$variable = str_sub(df1$variable, end = -2)
+  
+  df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  # df1 <- df1 %>%
+  #   group_by(sample) %>%
+  #   sample_n(size = 5000, replace = TRUE) %>%
+  #   ungroup() %>%
+  #   distinct()  # Remove duplicates
+  
+  p1 = ggplot(df1 %>% arrange(get("value")),
+              aes(x=UMAP_1,y=UMAP_2,col=value))+
+    geom_point(size=0.5)+
+    ylim(-7.5,7.5) + xlim(-9,9) +
+    theme_minimal()+
+    theme(legend.position = "none", 
+          axis.text = element_blank(), 
+          axis.title = element_blank())+
+    scale_color_viridis_c(option = "magma")+
+    facet_wrap(~sample)
+  
+  plts1 = lapply(unique(df1$sample), function(sampledata) {
+    df1 %>% 
+      filter(sample == sampledata) %>% arrange(get("value")) %>%
+      ggplot(aes(x=UMAP_1,y=UMAP_2,col=value))+
+      geom_point(size=0.5)+
+      ylim(-7.5,7.5) + xlim(-9,9) +
+      theme_minimal()+
+      theme(legend.position = "none", 
+            axis.text = element_blank(), 
+            axis.title = element_blank(), title = element_text(size = 7))+
+      scale_color_viridis_c(option = "magma")+
+      ggtitle(sampledata)-> p1
+    return(p1)
+  })
+  
+  p2 = ggplot(df1 %>% arrange(value),
+              aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+    geom_point(size=0.5)+
+    theme_minimal()+
+    ggtitle(Scores)+
+    theme(legend.position = "none", 
+          axis.text = element_blank(), 
+          axis.title = element_blank(), title = element_text(size=8))+
+    scale_color_viridis_c(option = "magma")
+  # facet_wrap(~variable)
+  # wrap_plots(c(list(p2),plts1))
+  
+  # normalized
+  p3 = arrangeGrob(
+    arrangeGrob(p2,
+                do.call(arrangeGrob, c(c(list(NULL,NULL),plts1[1:2]), ncol=2)),
+                nrow=1,
+                widths=c(1,1)),
+    do.call(arrangeGrob, c(plts1[3:10], nrow=2, list(widths=c(1,1,1,1)))),
+    nrow=2, heights=c(1,1))
+  
+  return(p3)
+}
+
+
+p1 = plot_score_umap(Scores = "EPI_ICM1")
+p2 = plot_score_umap(Scores = "PE1")
+p3 = plot_score_umap(Scores = "TE1")
+
+g1 = arrangeGrob(p1,p2,p3, nrow = 1)
+ggsave("../figures/score_preimp/qualitative_preimplantation_rpca_umap_v2.png", g1, width = 15, height = 5)
+# grid.arrange(
+#   do.call(arrangeGrob, c(plts1[1:8], ncol=2, list(heights=c(1,1,1,1)))),
+#     arrangeGrob(p2,
+#                 do.call(arrangeGrob, c(c(plts1[9],list(NULL), plts1[10],list(NULL)), ncol=2)),
+#               ncol=1,
+#               heights=c(1,1)),
+# ncol=2, widths=c(1,1))
+
+## RAW
+# df1 = plotting.data %>%
+#   dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+#   reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+#   group_by(sample) %>%
+#   mutate(value=minmaxNormalization(value))
+# # levels(df1$variable) =
+# df1$variable = str_sub(df1$variable, end = -2)
+#   
+# df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+# df1 <- df1 %>%
+#   group_by(sample) %>%
+#   sample_n(size = 5000, replace = TRUE) %>%
+#   ungroup() %>%
+#   distinct()  # Remove duplicates
+
+# plts1 = lapply(unique(df1$sample), function(sampledata) {
+#   df1 %>% filter(sample == sampledata) %>% arrange(get("value")) %>%
+#     ggplot(aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+#     geom_point(size=0.5)+
+#     theme_minimal()+
+#     theme(legend.position = "none", 
+#           axis.text = element_blank(), 
+#           axis.title = element_blank(), title = element_text(size = 8))+
+#     scale_color_viridis_c(option = "magma")+
+#     ggtitle(sampledata)-> p1
+#   return(p1)
+# })
+# 
+# p2 = ggplot(df1 %>% arrange(get("value")),
+#             aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+#   geom_point(size=0.5)+
+#   theme_minimal()+
+#     theme(legend.position = "none", 
+#         axis.text = element_blank(), 
+#         axis.title = element_blank())+
+#   scale_color_viridis_c(option = "magma")+
+#   ggtitle(Scores)
+# 
+# grid.arrange(
+#       arrangeGrob(p2,
+#                 do.call(arrangeGrob, c(c(list(NULL),plts1[9], list(NULL),plts1[10]), ncol=2)),
+#               ncol=1,
+#               heights=c(1,1)),
+#       do.call(arrangeGrob, c(plts1[c(2,1,4,3,6,5,8,7)], ncol=2, list(heights=c(1,1,1,1)))),
+# ncol=2, widths=c(1,1))
+```
+
+```{r}
+  Scores = c("EPI_ICM1", "PE1", "TE1")
+  int_method = vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+  
+  plotting.data$cluster = plotting.data[[cluster_column]]
+
+  ############
+df1 = plotting.data %>%
+  dplyr::select(cluster, sample, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample")) 
+  # group_by(sample) %>%
+  # mutate(value=scale(value))
+  # mutate(value=value-min(value))
+  # mutate(value=minmaxNormalization(value))
+# levels(df1$variable) =
+df1$variable = str_sub(df1$variable, end = -2)
+  
+# df1 %>% group_by(sample, variable) %>%
+#   summarise(value = mean(value)) %>%
+#   arrange(value) -> df2
+# 
+# df3 = df2 %>%
+#   pivot_wider(id_cols = sample, names_from = variable, values_from = value)
+# hc1 = hclust(dist(as.matrix(df3[,-1])))
+# # df1$sample = factor(df1$sample, levels = df3$sample[hc1$order])
+# df1$sample = factor(df1$sample, levels = unique(df2$sample))
+
+# ggplot(df1,
+#             aes(x=sample,y=value,fill=variable))+
+#   geom_violin(scale = "width")+
+#   theme_minimal()+
+#   coord_flip()+
+#   facet_wrap(~variable, ncol = 1)
+# 
+# ggplot(df1,
+#             aes(x=sample,y=value,fill=variable))+
+#   geom_violin(scale = "width")+
+#   theme_minimal()+
+#   coord_flip()
+    # theme(legend.position = "none", 
+    #     axis.text = element_blank(), 
+    #     axis.title = element_blank())+
+  # ggtitle(Scores)
+
+color_choices = c( "#F8766D", "#00BA38", "#619CFF")
+plts = lapply(seq_along(unique(df1$variable)), function(i) {
+  df1 %>% group_by(sample, variable) %>%
+    # summarise(value = stats::quantile(value, probs = 0.25)) %>%
+    summarise(value = stats::quantile(value, probs = 0.5)) %>%
+    # summarise(value = stats::quantile(value, probs = 0.75)) %>%
+    # summarise(value = diff(stats::quantile(value, probs = c(0.25, 0.75)))) %>%
+    filter(variable == unique(df1$variable)[i]) %>%
+    arrange(value) -> df2
+  
+  df1$sample = factor(df1$sample, levels = df2$sample)
+  
+  df1 %>% filter(variable == unique(df1$variable)[i]) %>%
+  ggplot(aes(x=sample,y=value))+
+  geom_violin(aes(fill=variable), scale = "width")+
+    # stat_summary(fun=median, geom="point", shape=23, size=2) +
+    geom_boxplot(width = 0.1, outliers = FALSE)+
+  theme_minimal()+
+    theme(legend.position = "none", 
+          axis.title.y = element_blank(),
+          axis.title.x = element_blank())+
+    ggtitle(unique(df1$variable)[i])+
+    scale_fill_manual(values=color_choices[i])+
+  coord_flip()-> p1
+  return(p1)
+})
+
+
+wrap_plots(plts, ncol = 1)
+ggsave("../figures/score_preimp/qualitative_preimplantation_violin.png", height = 10, width = 5)
+
+# plot_score_violin = function(df1){
+#   df1$variable = str_sub(df1$variable, end = -2)
+#   
+#   df1 %>% group_by(sample, variable) %>%
+#     summarise(value = mean(value)) %>%
+#     arrange(value) -> df2
+#   
+#   df1$sample = factor(df1$sample, levels = unique(df2$sample))
+#   
+#   ggplot(df1,
+#          aes(x=sample,y=value,fill=variable))+
+#     geom_violin(scale = "width")+
+#     theme_minimal()+
+#     # coord_flip()+
+#     facet_wrap(~variable, ncol = 1)}
+
+```
+
+
+```{r}
+
+df_sv_mnmx = plotting.data %>%
+  dplyr::select(cluster, sample, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample")) %>%
+  group_by(sample, variable) %>%
+  mutate(value=minmaxNormalization(value))
+df_sv_sc = plotting.data %>%
+  dplyr::select(cluster, sample, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample")) %>%
+  group_by(sample, variable) %>%
+  mutate(value=scale(value))
+df_sv_mn = plotting.data %>%
+  dplyr::select(cluster, sample, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample")) %>%
+  group_by(sample, variable) %>%
+  mutate(value=value-min(value))
+
+df_s_mnmx = plotting.data %>%
+  dplyr::select(cluster, sample, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample")) %>%
+  group_by(sample) %>%
+  mutate(value=minmaxNormalization(value))
+df_s_sc = plotting.data %>%
+  dplyr::select(cluster, sample, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample")) %>%
+  group_by(sample) %>%
+  mutate(value=scale(value))
+df_s_mn = plotting.data %>%
+  dplyr::select(cluster, sample, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample")) %>%
+  group_by(sample) %>%
+  mutate(value=value-min(value))
+
+df_ls = list(df1,
+             df_sv_mnmx,
+             df_sv_mn,
+             df_sv_sc,
+             df_s_mnmx,
+             df_s_mn,
+             df_s_sc)
+# levels(df1$variable) =
+
+lapply(df_ls, plot_score_violin)
+
+```
+```{r}
+tmp_data = plotting.data %>%
+  pivot_longer(cols = GetScoreNames(AllMarkers))
+ggplot(tmp_data, aes(x=annot_major, y=value))+
+  geom_violin()+
+  coord_flip()+
+  facet_grid(name~sample)
+```
+
+```{r}
+hex3 <- hue_pal()(3)
+celltype_color <- c(hex3, "lightgrey")
+
+```
+
+
+```{r}
+figure_qualitative_umap_preimplantation = function(Scores = c("EPI_ICM1","PE1","TE1")){
+df1 = plotting.data %>%
+  dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+  group_by(sample, variable) %>%
+  mutate(value=minmaxNormalization(value))
+# levels(df1$variable) =
+df1$variable = str_sub(df1$variable, end = -2)
+  
+df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+df1 <- df1 %>%
+  group_by(sample) %>%
+  # sample_n(size = 5000, replace = TRUE) %>%
+  ungroup() %>%
+  distinct()  # Remove duplicates
+
+p1 = ggplot(df1 %>% arrange(get("value")),
+       aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+  geom_point(size=0.5)+
+  theme_minimal()+
+  theme(legend.position = "none", strip.text.x = element_blank(), 
+        axis.title = element_blank(), axis.text = element_blank())+
+  scale_color_viridis_c(option = "magma")+facet_grid(sample~variable)
+
+p2 = ggplot(df1 %>% arrange(get("value")),
+            aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+  geom_point(size=0.5)+
+  theme_minimal()+
+  theme(legend.position = "none", 
+        axis.title = element_blank(), axis.text = element_blank())+
+  scale_color_viridis_c(option = "magma")+
+  facet_wrap(~variable, nrow=1)
+
+wrap_plots(list(p2,p1), heights = c(1,11))
+
+}
+figure_qualitative_umap_postimplantation = function(Scores = c("AMN1","EVT1","STB1")){
+df1 = plotting.data %>%
+  dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+  reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+  group_by(sample, variable) %>%
+  mutate(value=minmaxNormalization(value))
+# levels(df1$variable) =
+df1$variable = str_sub(df1$variable, end = -2)
+  
+df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+df1 <- df1 %>%
+  group_by(sample) %>%
+  # sample_n(size = 5000, replace = TRUE) %>%
+  ungroup() %>%
+  distinct()  # Remove duplicates
+
+p1 = ggplot(df1 %>% arrange(get("value")),
+       aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+  geom_point(size=0.5)+
+  theme_minimal()+
+  theme(legend.position = "none", strip.text.x = element_blank(), 
+        axis.title = element_blank(), axis.text = element_blank())+
+  scale_color_viridis_c(option = "magma")+facet_grid(sample~variable)
+
+p2 = ggplot(df1 %>% arrange(get("value")),
+            aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+  geom_point(size=0.5)+
+  theme_minimal()+
+  theme(legend.position = "none", 
+        axis.title = element_blank(), axis.text = element_blank())+
+  scale_color_viridis_c(option = "magma")+
+  facet_wrap(~variable, nrow=1)
+
+wrap_plots(list(p2,p1), heights = c(1,11))
+
+}
+
+
+i=3
+for(i in seq_along(vec_int)){
+  int_method = vec_int[i]
+  cluster_column <- paste0(int_method, "_clusters")
+  umaplab1 = paste0("umap",gsub("_","",int_method),"_1")
+  umaplab2 = paste0("umap",gsub("_","",int_method),"_2")
+  
+  plotting.data$cluster = plotting.data[[cluster_column]]
+  plotting.data$UMAP_1 = plotting.data[[umaplab1]]
+  plotting.data$UMAP_2 = plotting.data[[umaplab2]]
+  
+  tmp_df = plotting.data
+  # plotting.data$celltype = plotting.data$annot_major
+  tmp_df$sample = factor(tmp_df$sample, levels = unique(tmp_df$sample))
+  p1.1 = tmp_df %>%
+    ggplot(aes(x=UMAP_1,y=UMAP_2,col=celltype))+
+    geom_point(size=0.5)+
+    theme_minimal()+
+    scale_color_manual(values = celltype_color)+
+    facet_wrap(~sample, ncol=1)+
+    theme(legend.position = "none", strip.text.x = element_blank(), 
+          axis.title = element_blank(), axis.text = element_blank())
+  p1.2 = tmp_df %>%
+    ggplot(aes(x=UMAP_1,y=UMAP_2,col=celltype))+
+    geom_point(size=0.5)+
+    theme_minimal()+
+    scale_color_manual(values = celltype_color)+
+    theme(legend.position = "none", 
+          axis.title = element_blank(), axis.text = element_blank())+
+    ggtitle("Celltype")
+  
+  p1 = wrap_plots(list(p1.2,p1.1), heights = c(1,11))
+  
+  p2 = figure_qualitative_umap_preimplantation()
+  wrap_plots(list(p1,p2), widths = c(1,3))
+  ggsave(paste0("../figures/score_preimp/qualitative_preimplantation_",int_method,"_umap.png"), width=8, height=16)
+  
+  p3 = figure_qualitative_umap_postimplantation()
+  wrap_plots(list(p1,p3), widths = c(1,4))
+  ggsave(paste0("../figures/score_post/qualitative_postimplantation_",int_method,"_umap.png"), width=8, height=16)
+}
+
+
+for(j in seq(3)){
+  marker_genes = as.character(unlist(AllMarkers[j]))
+  marker_genes = marker_genes[marker_genes %in% colnames(plotting.data)]
+  fig_width = length(marker_genes)*1.75
+  p1 = figure_qualitative_umap_preimplantation()
+  # ggsave(paste0("05_analysis/marker_pre/marker_preimplantation_",names(AllMarkers)[j],"_",int_method,"_umap.png"), width=fig_width, height=16)
+  # ggsave(paste0("../05_analysis/marker_analysis/marker_preimplantation_",int_method,"_umap.png"), units="cm", width=16, height=12.8, dpi = "retina")
+  
+}
+```
+
+
+```{r}
+plotting.data
+
+library(plotly)
+
+tmp_data = plotting.data
+# normalize phenotype score by mean of known cells
+# for each score
+# for each data
+# compute score mean, minimum at zero, and divide 
+
+
+tmp_data = plotting.data[plotting.data$annot_major == "unknown",]
+
+plot_ly(tmp_data, x = ~EPI_ICM1, y = ~PE1, z = ~TE1) %>%
+  add_markers(color = ~sample)
+
+
+```
+

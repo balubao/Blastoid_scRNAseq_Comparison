@@ -1,0 +1,1009 @@
+---
+title: "integration_supplementary"
+author: "Ali Balubaid"
+date: "2024-02-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r activate conda env}
+# Multiple integration tools were devekloped in python. We use reticulate with a conda environment where all relevant packages are installed.
+
+library(reticulate)
+# Seeing your enviroments
+env_names = conda_list()
+
+#Using it
+# conda_list()[[1]][10] 
+# env_names$%>% 
+use_condaenv("/home/balubao/anaconda3/envs/blastoid_integration_env/bin/python", required = TRUE)
+```
+
+```{r}
+# set-up
+
+# renv::deactivate()
+setwd('/home/balubao/Documents/Research/blastoid_comparison/')
+source("script/Initiation.R", verbose = FALSE)
+
+require(gridExtra)
+require(grid)
+require(lattice)
+```
+
+# Supplementary file
+
+## Comment from Reviewer
+The integration of multiple public datasets is one of the key parts in this study. 
+Therefore, the customized integration methods and parameters used to mitigate batch effects should be more thoroughly explained.
+
+In response to the reviewer's request, we further explore different integration schemes, cluster the integrated data, and analyze the distribution of cell-types across the clusters.
+
+
+
+Top integration schemes:
+1. anchor-based SNN integration (RCPA)
+2. CCA alignment integration (CCA)
+<!-- 3. Scanorama snn (scanorama gene) -->
+3. MNN-based integratoin mnn (fastMNN)
+
+<!-- Try the following: -->
+<!-- Seurat v3 CCA -->
+<!-- Seurat v3 RPCA -->
+<!-- scanorama (gene) -->
+<!-- ?scVI -->
+<!-- scGen, scANVI, scVI -->
+
+
+
+## Data Preprocessing
+
+We load the preprocessed annotated data for integration.
+
+```{r load data}
+library(SeuratDisk)
+
+print("Loading data")
+seurat.list = readRDS("annotated_preintegrated_seurat_list.rds")
+
+
+```
+
+```{r}
+# colnames(seurat.list$Fan2021) = gsub("-1","",sapply(strsplit(colnames(seurat.list$Fan2021), split = "_"),"[[",4))
+# seurat.list$Fan2021 = AddMetaData(Fan2021, metadata = seurat.list$Fan2021@meta.data[grep("annot", colnames(seurat.list$Fan2021@meta.data) , value = TRUE)])
+
+# colnames(seurat.list$Liu2021) = gsub("-1","",sapply(strsplit(colnames(seurat.list$Liu2021), split = "_"),"[[",4))
+# seurat.list$Liu2021 = AddMetaData(Liu2021, metadata = seurat.list$Liu2021@meta.data[grep("annot", colnames(seurat.list$Liu2021@meta.data) , value = TRUE)])
+
+# colnames(seurat.list$Yu2021_5iLA) = gsub("-1","",sapply(strsplit(colnames(seurat.list$Yu2021_5iLA), split = "_"),"[[",4))
+# seurat.list$Yu2021_5iLA = AddMetaData(yu.list$Yu2021_5iLA, metadata = seurat.list$Yu2021_5iLA@meta.data[grep("annot", colnames(seurat.list$Yu2021_5iLA@meta.data) , value = TRUE)])
+
+# colnames(seurat.list$Yu2021_PXGL) = gsub("-1","",sapply(strsplit(colnames(seurat.list$Yu2021_PXGL), split = "_"),"[[",4))
+# seurat.list$Yu2021_PXGL = AddMetaData(yu.list$Yu2021_PXGL, metadata = seurat.list$Yu2021_PXGL@meta.data[grep("annot", colnames(seurat.list$Yu2021_PXGL@meta.data) , value = TRUE)])
+
+```
+
+
+
+```{r prepare data}
+
+# make features the same by turning back to gene IDs
+
+# for SS2, use feature metadata
+
+# for 10x, retrieve feature csv file
+feature.files = system(paste0("ls ../Data/*/","filtered_*_features.tsv.gz"), intern = T)
+feature.tables = lapply(feature.files, read.table)
+names(feature.tables) = make.unique(basename(dirname(feature.files)))
+
+df_ds = data.frame(seurat = c("Fan2021","Liu2021","Sozen2021","Yu2021_5iLA","Yu2021_PXGL"), 
+                   feat = c("Fan2021","Liu2021","Sozen2021","Yu2021","Yu2021.1"))
+df_ds = df_ds[c(2,4,5),]
+feature.tables = feature.tables[c(2,4,5)]
+
+for(i in seq_along(feature.tables)){
+  
+  #match rownames to feature names
+  feat.idx = match(rownames(seurat.list[[df_ds$seurat[i]]]), make.unique(feature.tables[[df_ds$feat[i]]]$V2))
+  
+  # get first two columns, gene_ID and gene name
+  ftb = feature.tables[[df_ds$feat[i]]][feat.idx,seq(2)]
+  
+  # rename columns
+  colnames(ftb) = c("ensembl_gene_id", "gene_names")
+  
+  # assemble transferable data.frame
+  f.meta = cbind(ftb, seurat.list[[df_ds$seurat[i]]][["RNA"]][[]])
+  rownames(f.meta) = rownames(seurat.list[[df_ds$seurat[i]]])
+  
+  # transfer
+  seurat.list[[df_ds$seurat[i]]][["RNA"]][[]] = f.meta
+}
+
+# turn into assay5 objects to change rownames
+for(i in seq_along(seurat.list)){
+  if(class(seurat.list[[i]][["RNA"]]) != "Assay5"){
+    seurat.list[[i]][["RNA"]] <- as(object = seurat.list[[i]][["RNA"]], Class = "Assay5")
+  }
+}
+
+# drop features with no ENSEMBL ID
+# seurat.list = lapply(seurat.list, function(x){ 
+#   x = x[!is.na(x[["RNA"]][[]]$ensembl_gene_id),]
+#   return(x)})
+
+# set all feature names to gene_IDs
+seurat.list = lapply(seurat.list, function(x){
+  newnames = x[["RNA"]][[]]$ensembl_gene_id
+  newnames[is.na(newnames)] = rownames(x[["RNA"]][[]])[is.na(newnames)]
+  rownames(x) = newnames
+  return(x)})
+
+# sanity check
+lapply(seurat.list, function(x) head(rownames(x)))
+lapply(seurat.list, function(x) table(is.na(rownames(x))))
+```
+
+
+```{r}
+
+
+# print("Updating data structure")
+# seurat5.list = lapply(seurat.list, function(obj){
+#   obj[["SCT5"]] <- as(object = obj[["SCT"]], Class = "Assay5")
+#   return(obj)
+# })
+
+print("Merging data")
+obj = merge(seurat.list[[1]], seurat.list[seq(2,length(seurat.list))])
+
+print("Splitting data")
+DefaultAssay(obj) = "RNA"
+
+obj = JoinLayers(obj)
+
+obj = split(obj, assay = "RNA", f = obj$sample)
+obj@assays$RNA@layers[grep("scale.data",names(obj@assays$RNA@layers))] = NULL
+
+print("Processing data")
+plan("multicore", workers = 32)
+obj <- FindVariableFeatures(obj)
+obj$ERCC.perc[is.na(obj$ERCC.perc)] = 0
+obj = ScaleData(obj, vars.to.regress = c("ERCC.perc","S.Score", "G2M.Score", "nFeature_RNA", "nCount_RNA"))
+obj <- RunPCA(obj)
+obj <- FindNeighbors(obj, dims = 1:30, reduction = "pca")
+split_obj <- FindClusters(obj, resolution = 2, cluster.name = "unintegrated_clusters")
+# split_obj = split_obj[rowSums(split_obj)>0,]
+
+save(split_obj, file = "preintegrated_seurat_obj.rda")
+# saveRDS(split_obj, "preintegrated_seurat_obj.rds")
+```
+
+```{r}
+load("preintegrated_seurat_obj.rda")
+```
+
+
+## Seurat CCA
+
+Our first integration method is the canonical correlation analysis (CCA) seurat integration method. This method identifies the CC components, which represent the dimensions with most variability, and does not require each to be perpindicular as with principal component analysis (PCA).  
+
+```{r Seurat V3 CCA}
+library(Seurat)
+library(SeuratWrappers)
+
+cca_int_obj = IntegrateLayers(object = split_obj, method = CCAIntegration, assay = "RNA",
+                              orig.reduction = "pca", new.reduction = "integrated.cca", 
+                              verbose = FALSE
+)
+
+
+
+```
+
+
+## Seurat RPCA
+
+Our second integration method uses reciprocal principal component analysis (RPCA). 
+
+```{r Seurat V3 RPCA}
+
+setwd('/home/balubao/Documents/Research/blastoid_comparison/')
+
+library(Seurat)
+library(SeuratWrappers)
+
+load("preintegrated_seurat_obj.rda")
+
+rpca_int_obj <- IntegrateLayers(
+  object = split_obj, method = RPCAIntegration,
+  orig.reduction = "pca", new.reduction = "integrated.rpca",
+  normalization.method = "LogNormalize",
+  k.weight = 80,
+  verbose = TRUE
+)
+
+rpca_ref_int_obj <- IntegrateLayers(
+  object = split_obj, method = RPCAIntegration,
+  orig.reduction = "pca", new.reduction = "integrated.rpca",
+  normalization.method = "LogNormalize", reference = seq(3),
+  k.weight = 80,
+  verbose = TRUE
+)
+
+save(rpca_int_obj, rpca_ref_int_obj, file = "rpca_integrated_blastoid.rda")
+
+
+```
+
+## QC Integrated Data
+```{r}
+# find clusters
+obj <- FindNeighbors(obj, reduction = "integrated.cca", dims = 1:30)
+obj <- FindClusters(obj, resolution = 2, cluster.name = "cca_clusters")
+
+obj <- FindNeighbors(obj, reduction = "integrated.rpca", dims = 1:30)
+obj <- FindClusters(obj, resolution = 2, cluster.name = "rpca_clusters")
+
+obj <- RunUMAP(obj, reduction = "integrated.cca", dims = 1:30, reduction.name = "umap.cca")
+p1 <- DimPlot(
+  obj,
+  reduction = "umap.cca",
+  group.by = c("Method", "predicted.celltype.l2", "cca_clusters"),
+  combine = FALSE, label.size = 2
+)
+
+obj <- FindNeighbors(obj, reduction = "integrated.scvi", dims = 1:30)
+obj <- FindClusters(obj, resolution = 2, cluster.name = "scvi_clusters")
+
+```
+
+```{r MNN}
+
+
+mnn_int_obj <- IntegrateLayers(
+  object = split_obj, method = FastMNNIntegration,
+  new.reduction = "integrated.mnn",
+  verbose = TRUE
+)
+saveRDS(mnn_int_obj, "mnn_integrated_blastoid.rds")
+
+
+```
+
+```{r Harmony}
+
+harmony_int_obj <- IntegrateLayers(
+  object = split_obj, method = HarmonyIntegration,
+  orig.reduction = "pca", new.reduction = "integrated.harmony",
+  normalization.method = "LogNormalize",
+  k.weight = 80,
+  verbose = TRUE
+)
+saveRDS(harmony_int_obj, "harmony_integrated_blastoid.rds")
+```
+
+```{ LIGER}
+library(Seurat)
+library(SeuratWrappers)
+library(rliger)
+
+pbmcsca <- ScaleData(pbmcsca, split.by = "Method", do.center = FALSE)
+pbmcsca <- RunOptimizeALS(pbmcsca, k = 20, lambda = 5, split.by = "Method")
+pbmcsca <- RunQuantileNorm(pbmcsca, split.by = "Method")
+# You can optionally perform Louvain clustering (`FindNeighbors` and `FindClusters`) after
+# `RunQuantileNorm` according to your needs
+pbmcsca <- FindNeighbors(pbmcsca, reduction = "iNMF", dims = 1:20)
+pbmcsca <- FindClusters(pbmcsca, resolution = 0.3)
+# Dimensional reduction and plotting
+pbmcsca <- RunUMAP(pbmcsca, dims = 1:ncol(pbmcsca[["iNMF"]]), reduction = "iNMF")
+DimPlot(pbmcsca, group.by = c("Method", "ident", "CellType"), ncol = 3)
+
+```
+
+```{ scanorama}
+# !pip install scvi
+library(reticulate)
+library(tidyverse)
+
+# 
+scanorama = import("scanorama")
+
+# Integration.
+counts.ls = lapply(seurat.list, function(seurat.obj){
+counts = as.matrix(seurat.obj[["RNA"]]$data)
+return(t(counts))
+})
+genes.ls = lapply(counts.ls, colnames)
+counts.ls = lapply(counts.ls, as.matrix)
+
+names(counts.ls) = NULL
+
+# alignmnet.out = scanorama$find_alignments(counts.ls, knn = 20L)
+integrated.data <- scanorama$integrate(counts.ls, genes.ls)
+
+print("Done integrating")
+
+```
+
+```{ scVI}
+# !pip install scvi
+library(reticulate)
+library(tidyverse)
+library(SeuratWrappers)
+#Checking python
+# scvi = import("scvi")
+# scib = import("scib")
+
+scvi_int_obj <- IntegrateLayers(
+object = split_obj, 
+method = scVIIntegration,
+orig.reduction = "pca",
+new.reduction = "integrated.scvi",
+conda_env = "/home/balubao/anaconda3/envs/blastoid_integration_env", verbose = TRUE
+)
+saveRDS(scvi_int_obj, "scvi_integrated_blastoid.rds")
+
+```
+
+
+## Evaluate Integration
+<!-- https://www.nature.com/articles/s41592-021-01336-8#Sec11 -->
+To evaluate the different integration methods, we use the metrics introduced in scib listed below:
+
+### Biological Conservation
+* Cell type ASW
+* Cell cycle conservation
+* Graph cLISI
+* Adjusted rand index (ARI) for cell label
+* Normalised mutual information (NMI) for cell label
+* Highly variable gene conservation
+* Isolated label ASW
+* Isolated label F1
+* Trajectory conservation
+
+### Batch Correction
+* Batch ASW
+* Principal component regression
+* Graph iLISI
+* Graph connectivity
+* kBET (K-nearest neighbour batch effect)
+
+```{r scVI}
+# !pip install scvi
+library(reticulate)
+library(tidyverse)
+
+#Checking python
+# scvi = import("scvi")
+scib = import("scib")
+
+scib.metrics
+```
+
+
+
+```{python}
+# !pip install scib
+# !pip install 'scib[rpy2,bbknn]'
+
+import scib
+
+scib.metrics.
+
+
+```
+
+
+
+```{r}
+seurat.list = readRDS("annotated_seurat_list.rds")
+Integrated.seurat = LoadH5Seurat("intregrated_all_4.h5seurat")
+
+## transfer annotation labels
+annotation_labels = sapply(seurat.list, function(x) x$annot_major)
+annotation_labels = unlist(annotation_labels, use.names = TRUE)
+names(annotation_labels) = sub("^[^.]*\\.", "", names(annotation_labels))
+Integrated.seurat$annot_major = annotation_labels[match(names(annotation_labels), colnames(Integrated.seurat))]
+
+# generate plotting.data
+plotting.data = cbind(Integrated.seurat@meta.data, Embeddings(Integrated.seurat, reduction = 'umap'), t(GetAssayData(Integrated.seurat[["SCT"]])[unlist(AllMarkers),]))
+plotting.data$cluster = plotting.data$integrated_snn_res.2
+
+df_ds = data.frame(
+  # sample=names(seurat.list),
+  sample=sapply(seurat.list, function(x){unique(x$sample)}), 
+  ncells=sapply(seurat.list, ncol), 
+  nfeatures = sapply(seurat.list, function(x){sum(rowSums(x@assays$RNA)>10)}),
+  tech=sapply(seurat.list, function(x){unique(x$tech)}),
+  ref=sapply(seurat.list, function(x){unique(x$ref)}))
+
+```
+
+```{r}
+library(ggbreak)
+
+plotting.data$sample_celltype = paste0(plotting.data$sample, "_", plotting.data$annot_major)
+ggplot(plotting.data, aes(x = sample, y=log10(nCount_RNA)))+
+  # geom_violin(aes(fill=annot_major))+
+  geom_boxplot(aes(fill=annot_major))+
+  coord_flip() + scale_y_break(c(5.5, 10))
+
+library(ggridges)
+ggplot(plotting.data, aes(x = log10(nCount_TPM), y = sample))+
+  geom_density_ridges()
+
+
+```
+
+# Generate Figure 1 using new data.
+```{r}
+fig_1A_v2 = function(){
+  
+  Integrated.seurat@meta.data %>% group_by(sample) %>% count(annot_major) %>% mutate(n=n/sum(n))-> mat_ct_cnts
+  mat_ct_cnts = reshape2::acast(mat_ct_cnts, formula = sample ~ annot_major)
+  hclust_ct_cnts = hclust(dist(mat_ct_cnts))
+  
+  df_ds$sample = factor(df_ds$sample, levels = rownames(mat_ct_cnts)[hclust_ct_cnts$order])
+  
+  df_ds$`seq. platform` = df_ds$tech
+  p1 = ggplot(df_ds, aes(y=sample, x=log10(ncells), fill=`seq. platform`))+
+    geom_col()+
+    theme_bw()+
+    ylab("Dataset")+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+  p2 = ggplot(df_ds, aes(y=sample, x=nfeatures/10000, fill=`seq. platform`))+
+    geom_col()+
+    theme_bw()+
+    xlab("nfeatures (10k)")+
+    # theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.title.y = element_blank())
+  # p_sctype = ggplot(Integrated.seurat@meta.data, aes(x=customclassif, fill=sample))+
+  # geom_bar(position = "fill")+
+  # theme_bw()+
+  # theme(axis.text.x = element_text(angle=45, vjust = 1, hjust = 1))
+  
+  tb1 = table(plotting.data$sample, plotting.data$annot_major)
+  tb1 = sweep(tb1, 1, STATS = rowSums(tb1), "/")
+  tb1 = as.data.frame.matrix(tb1)
+  tb1$samples = rownames(tb1)
+  tb1 = as.data.frame(tb1, row.names = rownames(tb1))
+  
+  pretmp = df_ds %>% mutate(log10_ncells = log10(ncells)) %>% mutate(nfeatures_10k = nfeatures/1e4)
+  tmp = cbind(pretmp,tb1[match(pretmp$sample,tb1$sample),])
+  
+  tmp = reshape2::melt(tmp)
+  tmp$sample = factor(tmp$sample, levels = rownames(mat_ct_cnts)[hclust_ct_cnts$order])
+  tmp$variable = factor(tmp$variable)
+  tmp$`frac. of cells` = tmp$value
+  #, levels = c("ncells","nfeatures","log10_ncells","nfeatures_10k","Inner cell mass","Epiblast cells","Primitive Endoderm cells","Trophoblast cells",
+  #          "Early Amnion","Late Amnion","extravillous cytotrophoblasts","Syncytiotrophoblasts","cytotrophoblasts","Unknown"))
+  # tmp$sample = fct_inorder(tmp$sample)
+  # p1 = tmp %>% filter(variable %in% "log10_ncells") %>% ggplot()+
+  #   geom_tile(aes(y=sample, x=variable, fill=value))+
+  #   scale_fill_gradient(low = "black", high = "green")+ 
+  #   xlab("")+
+  #   theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+  # p2 = tmp %>% filter(variable %in% "nfeatures_10k") %>% ggplot()+
+  #   geom_tile(aes(y=sample, x=variable, fill=value))+
+  #   scale_fill_gradient(low = "black", high = "purple")+ 
+  #   xlab("")+
+  #   theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+  #         axis.text.y = element_blank(),
+  #         axis.ticks.y = element_blank(),
+  #         axis.title.y = element_blank())
+  p3 = tmp %>% filter(variable %in% levels(tmp$variable)[-c(1,2,3,4)]) %>% ggplot()+
+    geom_tile(aes(y=sample, x=variable, fill=`frac. of cells`))+
+    scale_fill_viridis_c()+
+    # scale_fill_gradient2(midpoint=0.5, 
+    # low="blue", 
+    # mid="white",
+    # high="red", 
+    # space ="Lab")+
+    xlab("") + 
+    coord_fixed() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.title.y = element_blank())
+  p4 = ggdendrogram(hclust_ct_cnts, rotate = TRUE, size = 3, labels = FALSE) + theme_void()
+  
+  wrap_plots(list(p1,p2,p3,p4), design = "ABCD", guides = "collect")
+}
+fig_1A_v2()
+# ggsave("fig1A_data_summary.svg", width = 12, height = 6, dpi = "retina")
+```
+
+
+```{r}
+fig_1B = function(){
+  plotting.ls = lapply(seurat.list, function(x){tmp_plotting.data = cbind(x@meta.data, Embeddings(x, "umap"))})
+  # tmp_plotting = do.call("rbind", plotting.ls)
+  tmp_plotting = rbindlist(plotting.ls, use.names = TRUE, fill = TRUE)
+  tmp_plotting$`annotations (auto)` = tmp_plotting$annot_major
+  sampled_data <- tmp_plotting %>%
+    group_by(sample) %>%
+    sample_n(size = 5000, replace = TRUE) %>%
+    ungroup() %>%
+    distinct()  # Remove duplicates
+  ggplot(sampled_data, aes(x=umap_1, y=umap_2, color=`annotations (auto)`))+
+    geom_point(size=0.5)+
+    theme_bw()+
+    coord_fixed()+
+    facet_wrap(~sample, nrow = 2)+
+    theme(strip.text = element_text(size=6))
+  
+}
+fig_1B()
+ggsave("fig1B_data_UMAP.svg", width = 12, height = 4.5, dpi = "retina")
+```
+
+```{r}
+p1 = DimPlot(Integrated.seurat, group.by = "seurat_clusters", label = TRUE) +     
+  # theme_void() +
+  theme(legend.position = "none") + 
+  coord_fixed()
+p2 = DimPlot(Integrated.seurat, group.by = "annot_major") + 
+  theme(legend.position = "none") + 
+  # scale_fill_viridis_d(option = "D")+
+  coord_fixed()
+p3 = DimPlot(Integrated.seurat, group.by = "sample") + 
+  theme(legend.position = "none") + 
+  coord_fixed()
+cowplot::plot_grid(p1,p2,rel_heights=c(1,1), ncol = 1)
+```
+
+# Celltype Distributions
+```{r}
+plotting.data$cluster = plotting.data$rpca_clusters 
+tmp_mat = as.matrix(table(plotting.data$cluster, plotting.data$annot_major))
+clust_annot_hclust = hclust(dist(tmp_mat))
+tmp = plotting.data
+tmp$cluster = factor(tmp$cluster, levels = levels(tmp$cluster)[clust_annot_hclust$order])
+
+p1 = ggplot(tmp, aes(x=cluster, fill=annot_major))+
+  geom_bar()+
+  scale_y_discrete(expand=c(0,0))+
+  coord_flip()+
+  theme(axis.title.y = element_blank(),
+        axis.ticks = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+p2 = ggdendrogram(clust_annot_hclust, labels = FALSE, rotate = TRUE) + 
+  theme_void() + 
+  scale_y_discrete(expand=c(0,0))+
+  scale_y_reverse()
+
+# p2 + p1 + plot_layout(ncol = 2, widths = c(1, 2))
+cowplot::plot_grid(p2,p1,rel_widths=c(.4,1))
+
+
+
+tmp_mat = as.matrix(table(plotting.data$cluster, plotting.data$annot_major))
+clust_annot_hclust = hclust(dist(sweep(tmp_mat, 1, rowSums(tmp_mat), FUN = "/")))
+tmp = plotting.data
+tmp$cluster = factor(tmp$cluster, levels = levels(tmp$cluster)[clust_annot_hclust$order])
+
+
+p1 = ggplot(tmp, aes(x=cluster, fill=annot_major))+
+  geom_bar(position = "fill")+
+  scale_y_discrete(expand=c(0,0))+
+  coord_flip()+
+  scale_y_reverse()+
+  theme(axis.title.y = element_blank(),
+        axis.ticks = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+p2 = ggdendrogram(clust_annot_hclust, labels = FALSE, rotate = TRUE) + 
+  theme_void() + 
+  scale_y_discrete(expand=c(0,0))+
+  scale_y_reverse()
+
+# p2 + p1 + plot_layout(ncol = 2, widths = c(1, 2))
+cowplot::plot_grid(p2,p1,rel_widths=c(.4,1))
+```
+
+```{r}
+tmp_mat = as.matrix(table(plotting.data$cluster, plotting.data$annot_major))
+
+clust_annot_hclust = hclust(dist(tmp_mat))
+
+sample_names <- colnames(tmp_mat)
+
+# Obtain the dendrogram
+dend <- as.dendrogram(clust_annot_hclust)
+dend_data <- dendro_data(dend)
+
+# Setup the data, so that the layout is inverted (this is more 
+# "clear" than simply using coord_flip())
+segment_data <- with(
+  segment(dend_data), 
+  data.frame(x = y, y = x, xend = yend, yend = xend))
+
+# Use the dendrogram label data to position the gene labels
+gene_pos_table <- with(
+  dend_data$labels, 
+  data.frame(y_center = x, cluster = as.character(label), height = 1))
+
+# Table to position the samples
+sample_pos_table <- data.frame(celltype = sample_names) %>%
+  mutate(x_center = (1:n()), 
+         width = 1)
+
+# Neglecting the gap parameters
+heatmap_data <- tmp_mat %>% 
+  reshape2::melt(value.name = "n", varnames = c("cluster", "celltype")) %>%
+  mutate(cluster = as.character(cluster)) %>%
+  left_join(gene_pos_table) %>%
+  left_join(sample_pos_table)
+
+# Limits for the vertical axes
+gene_axis_limits <- with(
+  gene_pos_table, 
+  c(min(y_center - 0.5 * height), max(y_center + 0.5 * height))
+) + 
+  0.1 * c(-1, 1) # extra spacing: 0.1
+
+# Heatmap plot
+plt_hmap <- ggplot(heatmap_data, 
+                   aes(x = x_center, y = y_center, fill = n, 
+                       height = height, width = width)) + 
+  geom_tile() +
+  scale_fill_gradient2("expr", high = "darkred", low = "darkblue") +
+  scale_x_continuous(breaks = sample_pos_table$x_center, 
+                     labels = sample_pos_table$celltype, 
+                     expand = c(0, 0)) + 
+  # For the y axis, alternatively set the labels as: gene_position_table$gene
+  scale_y_continuous(breaks = gene_pos_table[, "y_center"], 
+                     labels = rep("", nrow(gene_pos_table)),
+                     limits = gene_axis_limits, 
+                     expand = c(0, 0)) + 
+  labs(x = "Celltype", y = "") +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = rel(1), hjust = 1, angle = 45), 
+        # margin: top, right, bottom, and left
+        plot.margin = unit(c(1, 0.2, 0.2, -0.7), "cm"), 
+        panel.grid.minor = element_blank())
+
+plt_dendr <- ggplot(segment_data) + 
+  geom_segment(aes(x = x, y = y, xend = xend, yend = yend)) + 
+  scale_x_reverse(expand = c(0, 0.5)) + 
+  scale_y_continuous(breaks = gene_pos_table$y_center, 
+                     labels = gene_pos_table$cluster, 
+                     limits = gene_axis_limits, 
+                     expand = c(0, 0)) + 
+  labs(x = "Distance", y = "", colour = "", size = "") +
+  theme_bw() + 
+  theme(panel.grid.minor = element_blank())
+
+library(cowplot)
+plot_grid(plt_dendr, plt_hmap, align = 'h', rel_widths = c(1, 1))
+```
+
+```{r}
+library(tidyverse)
+library(ggdendro)
+library(vegan)
+library(colorspace)
+library(cowplot)
+
+tb1=t(reshape2::acast(as.data.frame(table(plotting.data$cluster, plotting.data$annot_major)), formula = Var2~Var1))
+
+hc=hclust(dist(tb1),method="ward.D2")
+hc=reorder(hc,wts=-as.matrix(tb1)%*%seq(ncol(tb1))^2) # vegan::reorder.hclust
+tree=ggdendro::dendro_data(as.dendrogram(hc),type="rectangle")
+
+p1=ggplot(ggdendro::segment(tree))+
+  geom_segment(aes(x=y,y=x,xend=yend,yend=xend),lineend="round",size=.4)+
+  scale_x_continuous(expand=expansion(add=c(0,.01)))+ # don't crop half of line between top-level nodes
+  scale_y_continuous(limits=.5+c(0,nrow(tb1)),expand=c(0,0))+
+  theme(
+    axis.text=element_blank(),
+    axis.ticks=element_blank(),
+    axis.ticks.length=unit(0,"pt"), # remove extra space occupied by ticks
+    axis.title=element_blank(),
+    panel.background=element_rect(fill="white"),
+    panel.grid=element_blank(),
+    plot.margin=margin(5,5,5,0)
+  )
+
+tb1=tb1[hc$labels[hc$order],]
+t2=data.frame(V1=rownames(tb1)[row(tb1)],V2=colnames(tb1)[col(tb1)],V3=as.vector(tb1))
+lab=round(100*t2$V3)
+lab[lab==0]=""
+
+p2=ggplot(t2,aes(x=factor(V1,level=rownames(tb1)),y=V3,fill=V2))+
+  geom_bar(stat="identity",width=1,position=position_fill(reverse=T))+
+  # geom_text(aes(label=lab),position=position_stack(vjust=.5,reverse=T),size=3.5)+
+  coord_flip()+
+  scale_x_discrete(expand=c(0,0))+
+  scale_y_discrete(expand=c(0,0))+
+  # scale_fill_manual(values=colorspace::hex(HSV(head(seq(0,360,length.out=ncol(tb1)+1),-1),.5,1)))+
+  theme(
+    axis.text=element_text(color="black",size=11),
+    axis.text.x=element_blank(),
+    axis.ticks=element_blank(),
+    axis.title=element_blank(),
+    legend.position="none",
+    plot.margin=margin(5,0,5,5)
+  )
+
+cowplot::plot_grid(p2,p1,rel_widths=c(1,.4))
+# ggsave("a.png",height=.25*nrow(t),width=7)
+```
+
+
+# Dataset Distributions
+```{r}
+tmp_mat = as.matrix(table(plotting.data$cluster, plotting.data$sample))
+clust_annot_hclust = hclust(dist(tmp_mat))
+tmp = plotting.data
+tmp$cluster = factor(tmp$cluster, levels = levels(tmp$cluster)[clust_annot_hclust$order])
+
+p1 = ggplot(tmp, aes(x=cluster, fill=sample))+
+  geom_bar()+
+  scale_y_discrete(expand=c(0,0))+
+  coord_flip()+
+  theme(axis.title.y = element_blank(),
+        axis.ticks = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+p2 = ggdendrogram(clust_annot_hclust, labels = FALSE, rotate = TRUE) + 
+  theme_void() + 
+  scale_y_discrete(expand=c(0,0))+
+  scale_y_reverse()
+
+# p2 + p1 + plot_layout(ncol = 2, widths = c(1, 2))
+cowplot::plot_grid(p2,p1,rel_widths=c(.4,1))
+
+
+
+tmp_mat = as.matrix(table(plotting.data$cluster, plotting.data$sample))
+clust_annot_hclust = hclust(dist(sweep(tmp_mat, 1, rowSums(tmp_mat), FUN = "/")))
+tmp = plotting.data
+tmp$cluster = factor(tmp$cluster, levels = levels(tmp$cluster)[clust_annot_hclust$order])
+
+
+p3 = ggplot(tmp, aes(x=cluster, fill=sample))+
+  geom_bar(position = "fill")+
+  scale_y_discrete(expand=c(0,0))+
+  coord_flip()+
+  scale_y_reverse()+
+  theme(axis.title.y = element_blank(),
+        axis.ticks = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+p4 = ggdendrogram(clust_annot_hclust, labels = FALSE, rotate = TRUE) + 
+  theme_void() + 
+  scale_y_discrete(expand=c(0,0))+
+  scale_y_reverse()
+
+# p2 + p1 + plot_layout(ncol = 2, widths = c(1, 2))
+cowplot::plot_grid(p4,p3,rel_widths=c(.4,1))
+```
+
+```{r}
+tmp_mat = as.matrix(table(plotting.data$cluster, plotting.data$sample))
+clust_annot_hclust = hclust(dist(sweep(tmp_mat, 1, rowSums(tmp_mat), FUN = "/")))
+samp_annot_hclust = hclust(dist(sweep(tmp_mat, 2, colSums(tmp_mat), FUN = "/")))
+
+tmp_mat = as.matrix(table(plotting.data$cluster, plotting.data$sample))
+tmp_mat = sweep(tmp_mat, 2, colSums(tmp_mat), FUN = "/")
+tmp = as.data.frame(tmp_mat)
+colnames(tmp) = c("cluster", "sample", "proportion")
+tmp$cluster = factor(tmp$cluster, levels = levels(tmp$cluster)[clust_annot_hclust$order])
+tmp$sample = factor(tmp$sample, levels = levels(tmp$sample)[samp_annot_hclust$order])
+
+# Now, plot with geom_col using the calculated proportions
+p3 <- ggplot(tmp, aes(x=cluster, y=proportion, fill=sample)) +
+  geom_col()+
+  scale_y_discrete(expand=c(0,0))+
+  coord_flip()+
+  theme(axis.title.y = element_blank(),
+        axis.ticks = element_blank(),
+        # axis.text.y = element_blank(), # Changed from axis.text.x to axis.text.y for flipped coordinates
+        axis.title.x = element_blank())+
+  # strip.text.x = element_text(size=5))+
+  facet_grid(~sample)
+
+# Print the plot
+p3
+
+
+```
+
+
+```{r}
+
+tmp_mat = as.matrix(table(plotting.data$cluster, plotting.data$annot_major))
+clust_annot_hclust = hclust(dist(sweep(tmp_mat, 1, rowSums(tmp_mat), FUN = "/")))
+tmp = plotting.data
+tmp$cluster = factor(tmp$cluster, levels = levels(tmp$cluster)[clust_annot_hclust$order])
+
+tmp$CellType = tmp$annot_major
+tmp$DataSet = tmp$sample
+tmp$Clusters = tmp$cluster
+
+p1 = ggplot(tmp, aes(x=Clusters, fill=CellType))+
+  geom_bar(position = "fill")+
+  scale_y_discrete(expand=c(0,0))+
+  coord_flip()+
+  # coord_fixed(ratio = 10)+
+  # scale_fill_viridis_d(option = "D")+
+  scale_y_reverse()+
+  theme(axis.title.y = element_text(),
+        axis.ticks = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(), 
+        legend.position = "right") 
+
+# clust_annot_hclust = hclust(dist(sweep(tmp_mat, 1, rowSums(tmp_mat), FUN = "/")))
+# tmp = plotting.data
+# tmp$cluster = reorder(tmp$cluster, new.order = levels(tmp$cluster)[clust_annot_hclust$order])
+
+
+p3 = ggplot(tmp, aes(x=Clusters, fill=DataSet))+
+  geom_bar(position = "fill")+
+  scale_y_discrete(expand=c(0,0))+
+  coord_flip()+
+  # coord_fixed(ratio = 10)+
+  scale_fill_viridis_d(option = "H")+
+  scale_y_reverse()+
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = "right")
+
+
+# cowplot::plot_grid(p1,p3,rel_widths=c(1,1), nrow=1)
+wrap_plots(list(p1, p3), guides = "collect")
+```
+
+
+```{r}
+# install.packages("remotes")
+# remotes::install_github("davidsjoberg/ggsankey")
+library(ggsankey)
+
+# df_long = plotting.data %>%
+#   make_long(cluster, sample, annot_major)
+# 
+# ggplot(df_long, aes(x = x, 
+#                next_x = next_x, 
+#                node = node, 
+#                next_node = next_node,
+#                fill = factor(node),
+#                label = node)) +
+#   geom_sankey() +  
+#   geom_sankey_label(size = 3.5, color = 1, fill = "white") +
+#   scale_fill_viridis_d(option = "H") +
+#   theme_sankey(base_size = 16) +
+#   theme(legend.position = "none")
+
+
+df_long = plotting.data %>%
+  make_long(sample, annot_major)
+
+ggplot(df_long, aes(x = x, 
+                    next_x = next_x, 
+                    node = node, 
+                    next_node = next_node,
+                    fill = factor(node),
+                    label = node)) +
+  geom_sankey(flow.alpha = 0.5, node.color = 1) +
+  geom_sankey_label(size = 3.5, color = 1, fill = "white") +
+  scale_fill_viridis_d(option = "D") +
+  theme_sankey(base_size = 16) +
+  theme(legend.position = "none")
+```
+
+```{r}
+library(ggalluvial)
+
+tmp_df = plotting.data %>%
+  group_by(cluster, annot_major, sample) %>%
+  summarise(n=n())
+
+ggplot(data = tmp_df,
+       aes(axis1 = cluster,   # First variable on the X-axis
+           axis2 = annot_major, # Second variable on the X-axis
+           axis3 = sample,   # Third variable on the X-axis
+           y = n)) +
+  geom_alluvium(aes(fill = annot_major)) +
+  geom_stratum() +
+  geom_text(stat = "stratum",
+            aes(label = after_stat(stratum))) +
+  scale_x_discrete(limits = c("Survey", "Response"),
+                   expand = c(0.15, 0.05)) +
+  theme_void()
+
+
+
+
+tmp_df = plotting.data %>%
+  group_by(sample, cluster, annot_major) %>%
+  summarise(n=n()) %>% 
+  ungroup(annot_major) %>%
+  mutate(prop = n/sum(n))
+
+ggplot(data = tmp_df,
+       aes(axis1 = cluster,   # First variable on the X-axis
+           axis2 = annot_major, # Second variable on the X-axis
+           axis3 = sample,   # Third variable on the X-axis
+           y = prop)) +
+  geom_alluvium(aes(fill = annot_major), curve_type = "sigmoid") +
+  geom_stratum() +
+  geom_text(stat = "stratum",
+            aes(label = after_stat(stratum))) +
+  scale_x_discrete(limits = c("Survey", "Response"),
+                   expand = c(0.15, 0.05)) +
+  theme_void()
+
+
+tmp_df = plotting.data %>%
+  group_by(sample, cluster, annot_major) %>%
+  summarise(n=n()) %>% 
+  ungroup(sample) %>%
+  mutate(prop = n/sum(n))
+
+ggplot(data = tmp_df,
+       aes(axis1 = cluster,   # First variable on the X-axis
+           axis2 = annot_major, # Second variable on the X-axis
+           axis3 = sample,   # Third variable on the X-axis
+           y = prop)) +
+  geom_alluvium(aes(fill = annot_major), curve_type = "sigmoid") +
+  geom_stratum() +
+  geom_text(stat = "stratum",
+            aes(label = after_stat(stratum))) +
+  scale_x_discrete(limits = c("Survey", "Response"),
+                   expand = c(0.15, 0.05)) +
+  theme_void()
+```
+
+```{}
+library(SeuratDisk)
+
+print("Loading data")
+seurat.list = readRDS("annotated_seurat_list.rds")
+
+print("Updating data structure")
+seurat5.list = lapply(seurat.list, function(obj){
+obj[["SCT5"]] <- as(object = obj[["SCT"]], Class = "Assay5")
+return(obj)
+})
+
+print("Merging data")
+obj = merge(seurat5.list[[1]], seurat5.list[seq(2,length(seurat5.list))])
+
+print("Splitting data")
+DefaultAssay(obj) = "SCT5"
+
+obj = JoinLayers(obj)
+
+obj[["SCT5"]] = split(obj, assay = "SCT5", f = obj$sample)
+
+print("Processing data")
+obj <- FindVariableFeatures(obj)
+obj <- RunPCA(obj)
+obj <- FindNeighbors(obj, dims = 1:30, reduction = "pca")
+split_obj <- FindClusters(obj, resolution = 2, cluster.name = "unintegrated_clusters")
+
+split_obj = split_obj[rowSums(split_obj)>0,]
+# seurat.list = readRDS("annotated_seurat_list.rds")
+# obj = merge(seurat.list[[1]], seurat.list[-1])
+# obj = CreateSeuratObject(counts = )
+
+```

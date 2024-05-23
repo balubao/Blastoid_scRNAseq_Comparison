@@ -1,0 +1,929 @@
+---
+title: "source_line_analysis"
+author: "Ali Balubaid"
+date: "2024-04-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+SamOG.seurat = LoadH5Seurat("../Data/SamOG2021/SamOG_pp.h5seurat")
+DefaultAssay(SamOG.seurat) = "RNA"
+```
+
+```{r}
+PlotQCMetrics(SamOG.seurat@meta.data,
+              nCount_thresh = 2e4, #mad_thresh(tmp$nCount_RNA, direction = 'lower'),
+              nFeature_thresh = 5e3, #mad_thresh(tmp$nFeature_RNA, direction = 'lower'),
+              mitoRatio_thresh = 0.1,
+              riboRatio_thresh = NULL,
+              log10FeatPerCount_thresh = 0.8, assay="RNA")
+SamOG.seurat = subset(SamOG.seurat, (mitoRatio < 0.1) &
+                        (nCount_RNA > 2e4) &
+                        (nFeature_RNA > 5e3))
+PlotQCMetrics(SamOG.seurat@meta.data,
+              nCount_thresh = 2e4, #mad_thresh(tmp$nCount_RNA, direction = 'lower'),
+              nFeature_thresh = 5e3, #mad_thresh(tmp$nFeature_RNA, direction = 'lower'),
+              mitoRatio_thresh = 0.1,
+              riboRatio_thresh = NULL,
+              log10FeatPerCount_thresh = 0.8, assay="RNA")
+```
+
+
+```{r}
+
+## normalize 
+SamOG.seurat = NormalizeData(SamOG.seurat) %>% FindVariableFeatures(nfeatures = 3000)
+
+# scale (regress out CC.Score, ERCC.perc)
+SamOG.seurat = CellCycleScoring(SamOG.seurat, 
+                                       s.features = cc.genes.updated.2019$s.genes,
+                                       g2m.features = cc.genes.updated.2019$g2m.genes)
+SamOG.seurat$CC.Score = SamOG.seurat$G2M.Score - SamOG.seurat$S.Score
+SamOG.seurat = ScaleData(SamOG.seurat, vars.to.regress = c("S.Score", "G2M.Score", "nFeature_RNA", "nCount_RNA"))
+SamOG.seurat = ScaleData(SamOG.seurat, 
+                         features = unlist(AllMarkers),
+                         vars.to.regress = c("S.Score", "G2M.Score", "nFeature_RNA", "nCount_RNA"))
+
+# dimension reduction
+SamOG.seurat = RunPCA(SamOG.seurat)
+ElbowPlot(SamOG.seurat)
+
+# cluster
+SamOG.seurat = FindNeighbors(SamOG.seurat, reduction = "pca", dims = 1:10) %>% FindClusters(resolution = 2)
+
+# visualize and sanity check
+SamOG.seurat = RunUMAP(SamOG.seurat, reduction = "pca", dims = 1:10)
+DimPlot(SamOG.seurat, group.by = c("sample","seurat_clusters", "Phase"))
+
+# save normalized, clustered datasets
+require(SeuratDisk)
+SaveH5Seurat(SamOG.seurat, "../Data/SamOG2021/SamOG_filtered_pp", overwrite = TRUE)
+
+```
+
+```{r}
+require(SeuratDisk)
+SamOG.seurat = LoadH5Seurat("../Data/SamOG2021/SamOG_filtered_pp.h5seurat")
+
+```
+
+```{r}
+DimPlot(SamOG.seurat, reduction = "umap", group.by = c("sample", "seurat_clusters"), ncol=2, label=TRUE, label.size = 5) & NoLegend()
+FeaturePlot(SamOG.seurat, features = c("nFeature_RNA", "nCount_RNA", "mitoRatio", "riboRatio"), order = T)
+FeaturePlot(SamOG.seurat, features = GetScoreNames(AllMarkers), order = T, ncol=7)
+FeaturePlot(SamOG.seurat, features = unlist(AllMarkers), order = T, ncol = 10)
+
+VlnPlot(SamOG.seurat, features = GetScoreNames(AllMarkers), ncol=7)
+VlnPlot(SamOG.seurat, features = unlist(AllMarkers),ncol = 10)
+```
+
+
+```{r}
+gexp.mat = GetAssayData(SamOG.seurat[unlist(AllMarkers),])
+gexp.df = as.data.frame(t(gexp.mat))
+gexp.df$sample = SamOG.seurat$sample
+gexp.df = reshape2::melt(gexp.df)
+gexp.df_avg = gexp.df %>% group_by(sample, variable) %>%
+  summarise(avg.value = mean(value))
+gexp.df_pval = gexp.df %>% group_by(variable) %>%
+  do(w = wilcox.test(value~sample, data = ., paired=FALSE)) %>% 
+    summarise(variable, Pvalue = w$p.value) %>%
+  mutate(Adjusted_Pval = p.adjust(Pvalue, method = p.adjust.methods))
+
+gexp.df_lfc = data.frame(genes=unique(gexp.df_avg$variable))
+lfc_value = c()
+for(i in seq_along(unique(gexp.df_avg$variable))){
+  idx.var = gexp.df_avg$variable %in% unique(gexp.df_avg$variable)[i]
+  tmp.df = gexp.df_avg[idx.var, ]
+  lfc_value = c(lfc_value, log2(tmp.df$avg.value[tmp.df$sample=="EPSCs"] / tmp.df$avg.value[tmp.df$sample=="nPSCs"]))
+}
+gexp.df_lfc$module = names(unlist(AllMarkers)[unlist(AllMarkers) %in% rownames(gexp.mat)])
+gexp.df_lfc$LFC = lfc_value
+gexp.df_lfc = cbind(gexp.df_lfc, gexp.df_pval[match(gexp.df_lfc$genes, gexp.df_pval$variable),-1])
+gexp.df_lfc$LFC[is.infinite(gexp.df_lfc$LFC)] = NA
+
+gexp.df_lfc = gexp.df_lfc %>%
+  filter(abs(LFC > 0.25) & (Adjusted_Pval < 0.01))
+
+gexp.df_lfc$module = gsub("[0-9]", "", gexp.df_lfc$module)
+```
+
+```{r}
+## FIGURES
+
+plotting.data_src = cbind(SamOG.seurat@meta.data, Embeddings(SamOG.seurat, reduction = "umap"), t(GetAssayData(SamOG.seurat, assay = "RNA")[rownames(SamOG.seurat) %in% unlist(AllMarkers),]))
+plotting.data_src$cluster = plotting.data_src$seurat_clusters
+plotting.data_src$UMAP_1 = plotting.data_src$umap_1
+plotting.data_src$UMAP_2 = plotting.data_src$umap_2
+
+figure_4A = function(){
+  # pl=DimPlot(SamOG.seurat, reduction = "umap", group.by = c("sample"), label=TRUE, label.size = 5)
+  pl=ggplot()+
+    geom_point(data = plotting.data_src, mapping = aes(x=UMAP_1, y=UMAP_2, col=sample),
+               size=0.5)+
+    plotting.data_src %>% group_by(sample) %>% summarise(UMAP_1=mean(UMAP_1), UMAP_2=mean(UMAP_2)) %>%
+    geom_text_repel(mapping = aes(x=UMAP_1, y=UMAP_2, label=sample), size=7)+
+    theme_void()+
+    theme(legend.position = "none")
+  pl
+}
+
+figure_4A()
+ggsave("07_src_analysis/fig4A_UMAP_src.svg", width=5, height=5, dpi = "retina")
+
+
+figure_qualitative_umap_src = function(Scores = paste0(names(AllMarkers),"1")){
+  df1 = plotting.data_src %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+  # dplyr::select(cluster, sample, UMAP_1, UMAP_2, EPI_ICM1, AMN1) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(variable) %>%
+    mutate(value=minmaxNormalization(value))
+  df1$variable = str_sub(df1$variable, end = -2)
+  df1$variable = factor(df1$variable) %>% fct_inorder()
+  df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  # p1 = ggplot(df1 %>% arrange(get("value")),
+  #             aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+  #   geom_point(size=0.5)+
+  #   theme_minimal()+
+  #   theme(legend.position = "none")+
+  #   scale_color_viridis_c(option = "magma")+facet_grid(sample~variable)
+  p2 = ggplot(df1 %>% arrange(get("value")),
+              aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+    geom_point(size=0.1)+
+    theme_classic()+
+    theme(legend.position = "none")+
+    scale_color_viridis_c(option = "magma")+
+    facet_wrap(~variable, nrow=1)+ theme(strip.background = element_blank())
+  p2
+  # wrap_plots(list(p2,p1), heights = c(1,10))
+  
+}
+
+figure_qualitative_umap_src(Scores = "EPI_ICM1")
+ggsave("07_src_analysis/fig4B_qualitative_umap_epiicm_src.svg", units="cm", width=5, height=5, dpi = "retina")
+
+figure_qualitative_umap_src(Scores = "AMN1")
+ggsave("07_src_analysis/fig4B_qualitative_umap_amn_src.svg", units="cm", width=5, height=5, dpi = "retina")
+
+# ggsave("07_src_analysis/fig4B_qualitative_umap_src.svg", units="cm", width=25, height=5, dpi = "retina")
+# ggsave("07_src_analysis/fig4B_qualitative_umap_src.svg", units="cm", width=10, height=6, dpi = "retina")
+```
+
+```{r}
+figure_qualitative_umap_src_raw = function(Scores = paste0(names(AllMarkers),"1")){
+  df1 = plotting.data_src %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, EPI_ICM1, AMN1) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    # group_by(sample) %>%
+    mutate(value=minmaxNormalization(value))
+  # df1 = plotting.data_src %>%
+    # dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+    # reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    # group_by(sample) %>%
+    # mutate(value=minmaxNormalization(value))
+  df1$variable = str_sub(df1$variable, end = -2)
+  df1$variable = factor(df1$variable) %>% fct_inorder()
+  df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  # p1 = ggplot(df1 %>% arrange(get("value")),
+  #             aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+  #   geom_point(size=0.5)+
+  #   theme_minimal()+
+  #   theme(legend.position = "none")+
+  #   scale_color_viridis_c(option = "magma")+facet_grid(sample~variable)
+  p2 = ggplot(df1 %>% arrange(get("value")),
+              aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+    geom_point(size=0.1)+
+    theme_classic()+
+    theme(legend.position = "none")+
+    scale_color_viridis_c(option = "magma")+
+    facet_wrap(~variable, nrow=1)+ theme(strip.background = element_blank())
+  p2
+  # wrap_plots(list(p2,p1), heights = c(1,10))
+  
+}
+figure_qualitative_umap_src_raw()
+# ggsave("07_src_analysis/fig4C_qualitative_umap_src_raw.svg", units="cm", width=25/7*2, height=5, dpi = "retina")
+ggsave("07_src_analysis/fig4C_qualitative_umap_src_raw.svg", units="cm", width=25, height=5, dpi = "retina")
+```
+
+```{r}
+# selected_markers =  c("POU5F1","NANOG","FGF4","BAMBI","KCNMA1","KRT19","CLDN7","EPCAM","KRT18","TAGLN","ANXA3","STC2","LINC01356","CDH1", "FABP5", "FOXH1", "FGFR1")
+tmp_df = gexp.df_lfc %>% arrange(Adjusted_Pval)
+selected_markers = as.character(tmp_df$genes)
+
+# selected_markers = sapply(selected_markers, function(x) paste0("`",x,"`"))
+require(ggpubr)
+
+PlotViolin = function(test_variable){
+  formula_eq <- paste0(test_variable, " ~ ", "sample")
+  p <- ggviolin(plotting.data_src, 
+                x = "sample", y = test_variable,
+                fill = "sample", palette = "jco")
+  p = p + geom_boxplot(width = 0.1)
+  label.y = max(plotting.data_src[[test_variable]])
+  p = p + stat_compare_means(formula = as.formula(formula_eq), data = plotting.data_src, method = "wilcox.test", label.y = label.y, label.x.npc = "center")
+  return(p)
+}
+
+plts =lapply(seq_along(selected_markers), function(i) PlotViolin(selected_markers[i]) #+
+               # ylab(paste0(tmp_df$genes[i]," (",tmp_df$module[i],")"))
+             )
+wrap_plots(plts, guides = "collect") & theme(legend.position = 'bottom')
+
+```
+
+```{r}
+
+figure_module_umap_src = function(Scores = paste0(names(AllMarkers),"1")){
+  df1 = plotting.data_src %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+  # dplyr::select(cluster, sample, UMAP_1, UMAP_2, EPI_ICM1, AMN1) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(variable) %>%
+    mutate(value=minmaxNormalization(value))
+  df1$variable = str_sub(df1$variable, end = -2)
+  df1$variable = factor(df1$variable) %>% fct_inorder()
+  df1$sample = ordered(df1$sample, levels = unique(df1$sample))
+  p2 = ggplot(df1 %>% arrange(get("value")),
+              aes_string(x='UMAP_1',y='UMAP_2',col='value'))+
+    geom_point(size=0.5)+
+    theme_classic()+
+    theme(legend.position = "none")+
+    scale_color_viridis_c(option = "magma")
+  p2
+  # wrap_plots(list(p2,p1), heights = c(1,10))
+  
+}
+PlotViolin_src = function(test_variable){
+  formula_eq <- paste0(test_variable, " ~ ", "sample")
+  p <- ggviolin(plotting.data_src, 
+                x = "sample", y = test_variable,
+                fill = "sample", palette = "jco")
+  p = p + geom_boxplot(width = 0.1)
+  label.y = max(plotting.data_src[[test_variable]])
+  p = p + stat_compare_means(formula = as.formula(formula_eq), data = plotting.data_src, method = "wilcox.test", label.y = label.y, label.x.npc = "middle")
+  return(p)
+}
+
+
+Scores = GetScoreNames(AllMarkers)
+for(i in seq_along(Scores)){
+  p_vl1 = PlotViolin_src(Scores[i]) & theme(legend.position = 'bottom')
+  p_umap1 = figure_module_umap_src(Scores = Scores[i])
+  wrap_plots(list(p_umap1,p_vl1), design = "AB", guides = "auto") + plot_annotation(title = paste0(Scores[i]))
+  ggsave(paste0("07_src_analysis/module_analysis/",Scores[i],"_umap_vln.svg"),height = 4, width = 7)
+}
+
+```
+
+
+```{r}
+selected_markers =  c("POU5F1","NANOG","FGF4","BAMBI","KCNMA1","KRT19","CLDN7","EPCAM","KRT18","TAGLN","ANXA3","STC2","LINC01356","CDH1", "FABP5", "FOXH1", "FGFR1")
+
+plotting.data_src2 = cbind(plotting.data_src, t(GetAssayData(SamOG.seurat, assay = "RNA")[selected_markers,]))
+df1 = plotting.data_src2 %>%
+  dplyr::select(cluster, sample, UMAP_1, UMAP_2, EPI_ICM1, AMN1) %>%
+  reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+  group_by(variable) %>%
+  mutate(value=minmaxNormalization(value))
+
+df1 %>%
+  filter(variable == "EPI_ICM1") %>%
+ggplot(aes(x=variable, y=value))+
+  geom_violin(aes(fill=sample))+
+  geom_boxplot(aes(fill=sample), position = position_dodge(width = 0.9), width = 0.1)+
+  theme_bw()
+ggsave("07_src_analysis/figS4_module_violin_epiicm_src.svg", width = 2, height = 3)  
+
+df1 %>%
+  filter(variable == "AMN1") %>%
+ggplot(aes(x=variable, y=value))+
+  geom_violin(aes(fill=sample))+
+  geom_boxplot(aes(fill=sample), position = position_dodge(width = 0.9), width = 0.1)+
+  theme_bw()
+ggsave("07_src_analysis/figS4_module_violin_amn_src.svg", width = 2, height = 3)  
+  
+```
+
+
+```{r}
+# as.character(unlist(AllMarkers))[as.character(unlist(AllMarkers)) %in% colnames(plotting.data_src)]
+figureS4_marker_umap_src = function(Scores = selected_markers){
+  # SamOG.seurat = GetResidual(SamOG.seurat, features = selected_markers)
+  plotting.data_src2 = cbind(plotting.data_src, t(GetAssayData(SamOG.seurat, assay = "RNA")[selected_markers,]))
+  df1 = plotting.data_src2 %>%
+    dplyr::select(cluster, sample, UMAP_1, UMAP_2, all_of(Scores)) %>%
+    reshape2::melt(id.vars = c("cluster", "sample", "UMAP_1", "UMAP_2")) %>%
+    group_by(variable) %>%
+    mutate(value=minmaxNormalization(value))
+  
+  df1$sample = factor(df1$sample)
+  df1$sample = fct_inorder(df1$sample)
+  # df1$sample = ordered(df1$sample, levels = unique(df1$sample))es
+  # p1 = 
+  #   ggplot()+
+  #   geom_point(data = df1 %>% arrange(value), aes(x=UMAP_1,y=UMAP_2,col=value), size=0.05)+
+  #   # geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.5)+
+  #   geom_point(size=0.05)+
+  #   theme_minimal()+
+  #   theme(legend.position = "none", text = element_text(size=5))+
+  #   scale_color_viridis_c(option = "virdis")+facet_grid(sample~variable)
+  
+  df1 %>% filter(is.na(value)==FALSE) %>%  arrange(value) -> df2
+  df1 %>% filter(is.na(value)==TRUE) -> df3
+  p2 = 
+    ggplot()+
+    geom_point(data = df3, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.05)+
+    geom_point(data = df2, aes(x=UMAP_1,y=UMAP_2,col=value), size=0.05)+
+    # geom_point(df1 %>% arrange(is.na(value)) %>%  arrange(value),
+    #            aes_string(x='UMAP_1',y='UMAP_2',col='value'), size=0.5)+
+    theme_classic()+
+    theme(legend.position = "none", text = element_text(size=5))+
+    scale_color_viridis_c(option = "viridis")+
+    facet_wrap(~variable)+ theme(strip.background = element_blank(), strip.text = element_text(size=10))
+  p2
+  # wrap_plots(list(p2,p1), heights = c(1,10))
+}
+figureS4_marker_umap_src()
+ggsave("07_src_analysis/figS4_marker_umap_src.svg", units="cm", width=12, height=12, dpi = "print")
+# ggsave("figS4_marker_umap_src.svg", units="cm", width=16, height=12.8, dpi = "print")
+
+```
+
+```{r}
+##########
+### Module Markers - wilcoxon rank-sum
+
+# Create an empty list to store results
+wilcox_results <- list()
+
+# Get unique labels in the 'variable' column
+labels <- unique(gexp.df$variable)
+
+# Loop through each label and run the Wilcoxon test
+for (label in labels) {
+  subset_data <- gexp.df[gexp.df$variable == label, ]
+  wilcox_result <- wilcox.test(subset_data$value ~ subset_data$sample)
+  wilcox_results[[label]] <- wilcox_result
+}
+
+# Convert the list of Wilcoxon results into a dataframe
+wilcox_df <- data.frame(
+  Label = names(wilcox_results),
+  W_statistic = sapply(wilcox_results, function(x) x$statistic),
+  P_value = sapply(wilcox_results, function(x) x$p.value)
+)
+wilcox_df$marker = as.character(sub("\\..*", "", rownames(wilcox_df)))
+wilcox_df$Adjusted_P_value <- p.adjust(wilcox_df$P_value, method = "BH")
+wilcox_df$log2FoldChange = gexp.df_lfc$LFC[match(wilcox_df$marker, gexp.df_lfc$genes)]
+wilcox_df$gene = wilcox_df$marker
+
+wilcox_df = wilcox_df[order(-wilcox_df$log2FoldChange, na.last = TRUE), ]
+na.idx = !is.na(wilcox_df$log2FoldChange)
+wilcox_df[na.idx,] = wilcox_df[na.idx,][order(-wilcox_df[na.idx,]$Adjusted_P_value, decreasing = TRUE), ]
+
+# wilcox_df = wilcox_df[order(-wilcox_df$Adjusted_P_value, na.last = TRUE), ]
+# na.idx = !is.na(wilcox_df$Adjusted_P_value)
+# wilcox_df[na.idx,] = wilcox_df[na.idx,][order(-wilcox_df[na.idx,]$log2FoldChange), ]
+wilcox_df = as.data.frame(wilcox_df)
+wilcox_df$gene = factor(wilcox_df$gene) %>% fct_inorder()
+```
+
+```{r}
+fig4Da_marker_heatmap = function(){
+  # SamOG.seurat = GetResidual(SamOG.seurat, wilcox_df$marker)
+  wilcox_df_filtered = wilcox_df %>% 
+    filter(!is.na(log2FoldChange)) %>%
+    filter(abs(log2FoldChange) > 0.25) %>% 
+    filter(Adjusted_P_value < 0.01) %>%
+    arrange(log2FoldChange)
+  phm = DoHeatmap(SamOG.seurat, features = as.character(wilcox_df_filtered$gene), group.by = "sample", raster = FALSE) + NoLegend() + theme(axis.text.y = element_text(size=15))
+  phm
+}
+fig4Da_marker_heatmap() #add module tage
+ggsave("07_src_analysis/fig4Da_marker_heatmap.svg", units="cm", width=20, height=32, dpi = "retina")
+```
+
+```{r}
+fig4Db_marker_LFCpval = function(){
+  # Create the ggplot bar plot
+  plfc = ggplot(wilcox_df, aes(x = gene)) +
+    geom_bar(aes(y = log2FoldChange), stat = "identity", fill = "lightblue") +
+    labs(y = "L2FC") +
+    geom_text(aes(y=1, label = sprintf("%.2f", log2FoldChange)),  size = 5) +
+    theme_minimal() +
+    theme(axis.text.y = element_blank(), axis.title.y = element_blank(), axis.title.x = element_text(size=15))+
+    scale_y_discrete(position = "right")+
+    scale_x_discrete(limits = rev(levels(wilcox_df$gene)))+
+    coord_flip()  # To make it a horizontal bar plot
+  ppadj = ggplot(wilcox_df, aes(x = gene)) +
+    geom_bar(aes(y = -log10(Adjusted_P_value)), stat = "identity", fill = "lightblue") +
+    labs(y = "-log(Adj. P-Value)") +
+    geom_text(aes(y=1, label = sprintf("%.2e", Adjusted_P_value)), hjust=-0.2,  size = 5) +
+    theme_minimal() +
+    theme(axis.text.y = element_blank(), axis.title.y = element_blank(), axis.title.x = element_text(size=15))+
+    scale_y_discrete(position = "right")+
+    scale_x_discrete(limits = rev(levels(wilcox_df$gene)))+
+    coord_flip()  # To make it a horizontal bar plot
+  plfc+ppadj
+}
+fig4Db_marker_LFCpval()
+ggsave("07_src_analysis/fig4Db_marker_LFCpval.svg", units="cm", width=10, height=30, dpi = "retina")
+```
+
+```{r}
+##########
+### DEGs - wilcoxon rank-sum
+SamOG.seurat = SetIdent(SamOG.seurat, value = "sample")
+all.markers_src_wlx = FindAllMarkers(SamOG.seurat, test.use = "wilcox")
+all.markers_src_wlx = all.markers_src_wlx %>%
+  group_by(cluster) %>%
+  dplyr::filter((avg_log2FC > 0.25) & (p_val_adj < 0.01)) 
+all.markers_src_wlx %>%
+  slice_head(n = 20) %>%
+  ungroup() -> top10
+
+# DoHeatmap(SamOG.seurat, features = top10$gene, group.by = "sample") + NoLegend()
+# SamOG.seurat = GetResidual(SamOG.seurat, features = top10$gene)
+SamOG.seurat = ScaleData(SamOG.seurat, features = top10$gene, vars.to.regress = c("nCount_RNA", "nFeature_RNA", "S.Score", "G2M.Score"))
+
+fig4Ea_DEG_heatmap = function(){
+  # SamOG.seurat = GetResidual(SamOG.seurat, top10$gene)
+  phm = DoHeatmap(SamOG.seurat, features = as.character(top10$gene), group.by = "sample", raster = FALSE) + NoLegend()+theme(axis.text.y = element_text(size=15))
+  phm
+}
+fig4Ea_DEG_heatmap()
+ggsave("07_src_analysis/fig4Ea_DEG_heatmap.svg", units="cm", width=20, height=32, dpi = "retina")
+```
+Which ones are AMN markers?
+```{r}
+PATHSig = "/home/balubao/Documents/Research/blastoid_comparison/data/rostovska2022-te_amn.xlsx"
+SigGenes = readWorksheetFromFile(PATHSig, sheet = 1)
+Markers = SigGenes[-seq(5),2]
+Modules = SigGenes[-seq(5),1]
+LogFC = as.numeric(SigGenes[-seq(5),6])
+idx = grep(".vs.all", Modules)
+Markers = Markers[idx]
+Modules = Modules[idx]
+LogFC   = LogFC[idx]
+amn_deg_df = data.frame(Markers = Markers, Modules = Modules, LogFC = LogFC)
+
+amn_deg_df = amn_deg_df[!is.na(amn_deg_df$Markers),]
+amn_deg_df$Modules = factor(amn_deg_df$Modules)
+levels(amn_deg_df$Modules) = c("AME-E","AME-L","PSC","STB_rost")
+
+AMNsubMarkers = list()
+for(i in seq_along(unique(Modules))){
+  idx = Modules == unique(Modules)[i]
+  tmp = Markers[idx]
+  tmp2 = LogFC[idx]
+  tmp = tmp[order(tmp2, decreasing = T)]
+  
+  if(length(tmp)>TopN){
+    tmp = tmp[seq(TopN)]
+  }
+  
+  AMNsubMarkers = append(AMNsubMarkers, list(tmp))
+  
+}
+names(AMNsubMarkers) = c("AME-E","AME-L","PSC","STB_rost")
+# amn_deg_df = read.table("data/RostovskayaAmnDEGs.csv", header = TRUE)
+```
+
+```{r}
+top10[top10$gene %in% amn_deg_df$Markers[amn_deg_df$Modules == "AME-E"], ]
+```
+
+
+```{r}
+idx = match(all.markers_src_wlx$gene, amn_deg_df$Markers)
+src_v_amn_df = data.frame(Marker = all.markers_src_wlx$gene[!is.na(idx)], 
+                          Source_clust = all.markers_src_wlx$cluster[!is.na(idx)], 
+                          Rost_clust = amn_deg_df$Modules[idx[!is.na(idx)]])
+table(src_v_amn_df$Source_clust, src_v_amn_df$Rost_clust)
+
+top10_mod = top10[top10$gene %in% src_v_amn_df$Marker,]
+top10_mod$Rost_clust = src_v_amn_df$Rost_clust[match(top10_mod$gene, src_v_amn_df$Marker)]
+
+table(top10_mod$Rost_clust, top10_mod$cluster)
+
+all_src_amn_markers = all.markers_src_wlx
+all_src_amn_markers$Rost_clust = src_v_amn_df$Rost_clust[match(all_src_amn_markers$gene, src_v_amn_df$Marker)]
+
+ggplot(all_src_amn_markers, aes(y=avg_log2FC, x=cluster))+
+  geom_violin(aes(fill=cluster))+
+  geom_boxplot(width = 0.1)
+
+ggplot(all_src_amn_markers, aes(y=avg_log2FC, x=Rost_clust))+
+  geom_violin(aes(fill=cluster))+
+  geom_boxplot(aes(color=cluster), width = 0.1)
+
+ggplot(all_src_amn_markers, aes(y=pct.1, x=pct.2, color = avg_log2FC))+
+  geom_point()
+
+```
+```{r}
+
+GetCrossTable = function(marker.list){ 
+  mark_list = lapply(seq_along(marker.list), function(i){
+  idx = match(all.markers_src_wlx$gene, marker.list[[i]])
+  src_v_amn_df = data.frame(Marker = all.markers_src_wlx$gene[!is.na(idx)], 
+                            Source_clust = all.markers_src_wlx$cluster[!is.na(idx)], 
+                            Rost_clust = rep(names(marker.list)[i], sum(!is.na(idx))))
+  return(table(src_v_amn_df$Source_clust, src_v_amn_df$Rost_clust))
+})
+  
+do.call("cbind", mark_list)
+}
+
+marker_enr_tb = do.call("cbind",list(GetCrossTable(PrimLinMarkers),
+GetCrossTable(ICMsubMarkers),
+GetCrossTable(TEsubMarkers) ,
+GetCrossTable(EpivAmnMarkers),
+GetCrossTable(NvPMarkers),
+GetCrossTable(AMNsubMarkers)))
+marker_enr_tb
+sort(marker_enr_tb[1,]/marker_enr_tb[2,]) 
+#*colSums(marker_enr_tb))
+```
+
+```{r}
+all.markers_src_wlx %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 20) %>%
+  ungroup() -> top100
+  
+SamOG.seurat = ScaleData(SamOG.seurat, features = top100$gene, assay = "RNA", vars.to.regress = c("nCount_RNA", "nFeature_RNA", "S.Score", "G2M.Score"))
+DoHeatmap(SamOG.seurat, features = top100$gene, group.by = "sample", assay = "RNA")
+
+# One directional
+
+barcodeplot(all.markers_src_wlx$avg_log2FC, index = which(all.markers_src_wlx$gene %in% AMNsubMarkers$`AME-E`),
+            index2 = which(all.markers_src_wlx$gene %in% AMNsubMarkers$`AME-L`),
+            weights.label = "logFC")
+
+
+
+tmp_df = all.markers_src_wlx
+tmp_df$avg_log2FC = tmp_df$avg_log2FC*ifelse(tmp_df$cluster=="nPSCs", -1, 1)
+tmp_df %>%
+  arrange(desc(avg_log2FC)) -> tmp_df
+
+barcodeplot(tmp_df$avg_log2FC, index = which(tmp_df$gene %in% AMNsubMarkers$`AME-E`),
+            index2 = which(tmp_df$gene %in% AMNsubMarkers$PSC),
+            weights.label = c("AMN", "PSC"), xlab = "logFC", labels = c("nPSCs", "EPSCs"))
+
+barcodeplot(tmp_df$avg_log2FC, index = which(tmp_df$gene %in% EpivAmnMarkers$AMN12),
+            index2 = which(tmp_df$gene %in% EpivAmnMarkers$EPI12),
+            weights.label = "p_val_adj", labels = c("nPSCs", "EPSCs"))
+
+barcodeplot(tmp_df$avg_log2FC, index = which(tmp_df$gene %in% ICMsubMarkers$`PSA-EPI`),
+            weights.label = "p_val_adj", labels = c("nPSCs", "EPSCs"))
+
+pdf("07_src_analysis/")
+barcodeplot(tmp_df$avg_log2FC, index = which(tmp_df$gene %in% NvPMarkers$Naive),
+            index2 = which(tmp_df$gene %in% NvPMarkers$Primed),
+            weights.label = "Weight", xlab = "logFC", labels = c("nPSCs", "EPSCs"))
+
+
+
+
+
+
+
+```
+
+```{r}
+require(limma)
+design <- cbind(Intercept=1,Group=as.numeric(SamOG.seurat$sample)-1)
+
+res = limma::roast(GetAssayData(SamOG.seurat, assay = "RNA"), 
+                   index = AMNsubMarkers$`AME-E`, 
+                   design = design, contrast=2)
+
+res
+
+limma::barcodeplot(res)
+
+stat <- rnorm(100)
+sel <- 1:10
+sel2 <- 11:20
+stat[sel] <- stat[sel]+1
+stat[sel2] <- stat[sel2]-1
+
+
+```
+
+
+```{}
+library(clusterProfiler)
+LFC_thresh = 0.25
+adj.pval_thresh = 0.01
+
+amn_df = as.data.frame(AMNsubMarkers) %>%
+  pivot_longer(everything()) %>%
+  distinct(name, value, .keep_all = TRUE)
+enriched.ls = lapply(seq(2), function(i){
+  ct_markers = all.markers_src_wlx %>% filter(cluster==c(unique(all.markers_src_wlx$cluster))[i]) %>%
+    filter((avg_log2FC > LFC_thresh & p_val_adj<adj.pval_thresh)) #%>% #already filtered in the previous step
+  # slice_max(order_by = -log10(p_val), n = 1000)
+  
+  enrich_res = clusterProfiler::enricher(gene = ct_markers$gene, TERM2GENE = amn_df)
+  # enrich_res = enrichGO(ct_markers$enterez_id, OrgDb = "org.Hs.eg.db")
+  
+  return(enrich_res)
+})
+
+names(enriched.ls) = unique(all.markers_src_wlx$cluster)
+
+return(enriched.ls)
+
+```
+
+```{}
+require(clusterProfiler)
+
+# Connect to the ENSEMBL database
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# add enterez_id column to marker list
+
+  # extract symbols and ensembl_ids seperately
+    
+# Perform the query to get Entrez IDs
+results <- getBM(attributes = c('hgnc_id','hgnc_symbol', 'entrezgene_id', "transcript_length","ensembl_gene_id"),
+                 filters = c('hgnc_symbol'),
+                 values = all.markers_src_wlx$gene,
+                 mart = ensembl)
+results = results[!duplicated(results$hgnc_symbol),]
+
+all.markers_src_wlx$enterez_id = results$entrezgene_id[match(all.markers_src_wlx$gene, results$hgnc_symbol)]
+
+enriched.ls = lapply(seq(2), function(i){
+ct_markers = all.markers_src_wlx %>% filter(cluster==c(unique(all.markers_src_wlx$cluster))[i]) %>%
+filter((avg_log2FC > LFC_thresh & p_val_adj<adj.pval_thresh)) #%>% #already filtered in the previous step
+# slice_max(order_by = -log10(p_val), n = 1000)
+
+# enrich_res = clusterProfiler::enricher(gene = ct_markers$gene, TERM2GENE = amn_df)
+enrich_res_BP = enrichGO(ct_markers$enterez_id, OrgDb = "org.Hs.eg.db", ont = "BP")
+enrich_res_MF = enrichGO(ct_markers$enterez_id, OrgDb = "org.Hs.eg.db", ont = "MF")
+enrich_res_CC = enrichGO(ct_markers$enterez_id, OrgDb = "org.Hs.eg.db", ont = "CC")
+enrich_res_ALL = enrichGO(ct_markers$enterez_id, OrgDb = "org.Hs.eg.db", ont = "ALL")
+
+enrich_res = list(enrich_res_BP,
+enrich_res_MF,
+enrich_res_CC,
+enrich_res_ALL)
+return(enrich_res)
+})
+
+names(enriched.ls) = unique(all.markers_src_wlx$cluster)
+
+```
+
+```{}
+require(enrichplot)
+p1 = dotplot(enriched.ls$nPSCs)+ylab("nPSCs")
+p2 = dotplot(enriched.ls$EPSCs)+ylab("EPSCs")
+ncatagories = sapply(enriched.ls, nrow)
+ncatagories[ncatagories>10] = 10
+drop.cat = which(ncatagories != 0)
+ncatagories = ncatagories[drop.cat]
+design = paste(rep(c("A","B")[drop.cat], ncatagories), collapse = "\n")
+wrap_plots(list(p1,p2)[drop.cat], ncol = 2, guides = "collect")
+# ggsave(paste0("06_deg_analysis/GO_",names(enriched_all.ls)[i],"_clusterProfiler.png"), width = 7, height = sum(ncatagories)*0.8)
+
+
+upsetplot(enriched.ls$nPSCs)
+
+require(wordcloud)
+for(i in seq_along(enriched.ls)){
+go_enrich = enriched.ls[[i]]
+wcdf<-read.table(text=go_enrich$GeneRatio, sep = "/")[1]
+wcdf$term<-go_enrich[,2]
+wordcloud(words = wcdf$term, freq = wcdf$V1, scale=(c(4, .1)), colors=brewer.pal(8, "Dark2"), max.words = 25)
+}
+```
+
+
+```{}
+#BiocManager::install("enrichplot")
+library(enrichplot)
+upsetplot(go_enrich)
+
+wcdf<-read.table(text=go_enrich$GeneRatio, sep = "/")[1]
+wcdf$term<-go_enrich[,2]
+wordcloud(words = wcdf$term, freq = wcdf$V1, scale=(c(4, .1)), colors=brewer.pal(8, "Dark2"), max.words = 25)
+```
+
+
+```{r}
+## find AMN marker distribution along markers for starting cell lines
+tmp_df = all.markers_src_wlx
+tmp_df$avg_log2FC = tmp_df$avg_log2FC*ifelse(tmp_df$cluster=="nPSCs", -1, 1)
+tmp_df %>%
+  arrange(desc(avg_log2FC)) -> tmp_df
+tmp_df$AMN_enrich = tmp_df$gene %in% AMNsubMarkers$`AME-E`
+tmp_df2 = data.frame(idx = seq(nrow(tmp_df)), 
+                     AMN_enrich = cumsum(tmp_df$AMN_enrich), 
+                     logFC = tmp_df$avg_log2FC)
+
+tmp_df3 = data.frame(idx = c(which(tmp_df2$logFC<1)[1], 
+                             which(tmp_df2$logFC<0)[1],
+                             which(tmp_df2$logFC<(-1))[1]), 
+                     label = c("over expressed in EPSCs",
+                               "EPSC to nPSC transition",
+                               "over expressed in nPSCs"))
+tmp_df3$AMN_enrich = tmp_df2$AMN_enrich[tmp_df3$idx]
+tmp_df3$ref_point = 0
+
+ggplot(tmp_df2, aes(x = idx, y=AMN_enrich, color = logFC))+
+  geom_point()+
+  geom_segment(data = tmp_df3, aes(x = idx)) +
+  geom_hline(data = tmp_df3, aes(yintercept = AMN_enrich)) + 
+  scale_color_gradientn(colours = c("blue","white", "red"), 
+                        values = rescale(c(-1, 1)),
+                        limits = c(-1, 1))
+
+
+
+marker.list = split(all.markers_src_wlx, f = all.markers_src_wlx$cluster)
+lapply(list, function)
+all.markers_src_wlx$gene[] %in% AMNsubMarkers$`AME-E`
+```
+
+
+```{r}
+fig4Eb_DEG_LFCpval = function(){
+  # Create the ggplot bar plot
+  plfc = ggplot(top10, aes(x = gene)) +
+    geom_bar(aes(y = avg_log2FC), stat = "identity", fill = "lightblue") +
+    labs(y = "L2FC") +
+    geom_text(aes(y=1, label = sprintf("%.2f", avg_log2FC)),  size = 5) +
+    theme_minimal() +
+    theme(axis.text.y = element_blank(), axis.title.y = element_blank(), axis.title.x = element_text(size=15))+
+    scale_y_discrete(position = "right")+
+    scale_x_discrete(limits = rev(levels(top10$gene)))+
+    coord_flip()  # To make it a horizontal bar plot
+  ppadj = ggplot(top10, aes(x = gene)) +
+    geom_bar(aes(y = -log10(p_val_adj)), stat = "identity", fill = "lightblue") +
+    labs(y = "-log(Adj. P-Value)") +
+    geom_text(aes(y=1, label = sprintf("%.2e", p_val_adj)), hjust=1,  size = 5) +
+    theme_minimal() +
+    theme(axis.text.y = element_blank(), axis.title.y = element_blank(), axis.title.x = element_text(size=15))+
+    scale_y_discrete(position = "right")+
+    scale_x_discrete(limits = rev(levels(top10$gene)))+
+    coord_flip()  # To make it a horizontal bar plot
+  plfc+ppadj
+}
+fig4Eb_DEG_LFCpval()
+ggsave("07_src_analysis/fig4Eb_DEG_LFCpval.svg", units="cm", width=10, height=30, dpi = "retina")
+
+
+
+FeaturePlot(SamOG.seurat, features = GetScoreNames(AllMarkers), order = T)
+
+
+# fgseaResTidy %>% 
+#   dplyr::select(-leadingEdge, -ES, -nMoreExtreme) %>% 
+#   arrange(padj) %>% 
+#   head()
+# 
+# # only plot the top 20 pathways
+# ggplot(fgseaResTidy %>% filter(padj < 0.008) %>% head(n= 20), aes(reorder(pathway, NES), NES)) +
+#   geom_col(aes(fill= NES < 7.5)) +
+#   coord_flip() +
+#   labs(x="Pathway", y="Normalized Enrichment Score",
+#        title="Hallmark pathways NES from GSEA") + 
+#   theme_minimal()
+
+```
+
+```{r}
+## check particular genes?
+## project on blastoid/blastocyst data?
+
+## naive vs primed question
+
+
+ggplot(plotting.data_src, aes(x=EPI_ICM1, y=CTB1, color=sample))+
+  geom_point()+
+  geom_smooth(method = "glm")
+
+PlotVlnScore = function(score){
+  require(ggsignif)
+  pl = ggplot(plotting.data_src, aes(x=sample, y=.data[[score]]))+
+    geom_violin(aes(fill=sample))+
+    geom_boxplot(width=0.2)+
+    # geom_jitter(alpha=0.2)+
+    theme_minimal()+
+    theme(axis.title.y =  element_text(size=20), axis.title.x = element_blank(), axis.text.x = element_text(size=20))
+  geom_signif(comparisons = list(c("nPSCs", "EPSCs")), 
+              test="wilcox.test", map_signif_level=TRUE)
+  pl
+}
+pl.ls = lapply(as.list(Scores),PlotVlnScore)
+wrap_plots(pl.ls, guides = "collect")
+ggsave("07_src_analysis/figS4_module_violin_src.svg", units="cm", width=30, height=30, dpi = "print")
+
+
+VlnPlot(SamOG.seurat, features = Scores)
+#######################################################################################################
+```
+
+```{r}
+## Module Score Computation
+# Redo PE for cell lines.
+SamOG.seurat = GetAllModules(SamOG.seurat)
+SamOG.score_QC = SamOG.seurat$QCScores
+SamOG.seurat = SamOG.seurat$seurat.object
+
+## keep an eye out for:
+# EPI_ICM homogeniety in EPSC vs heterogeniety in nPSCs
+# PE and TE non existant.
+# AMN prevalence
+plts = FeaturePlot(SamOG.seurat, features = GetScoreNames(AllMarkers), combine = FALSE) 
+plts = lapply(plts, function(x) x + viridis::scale_color_viridis())
+wrap_plots(plts)
+
+Idents(SamOG.seurat) = SamOG.seurat$sample
+VlnPlot(SamOG.seurat, features = GetScoreNames(AllMarkers))
+
+perform_t_test <- function(data, column_name, group_column) {
+  # Extract groups
+  groups <- unique(data[[group_column]])
+  
+  # Only proceed if there are exactly two groups, otherwise return NA or an error message
+  if (length(groups) != 2) {
+    return(NA)
+  } else {
+    group1_data <- data[data[[group_column]] == groups[1], column_name]
+    group2_data <- data[data[[group_column]] == groups[2], column_name]
+    
+    # Perform t-test
+    test_result <- t.test(group1_data, group2_data)
+    
+    # Return the p-value (or entire test result based on your needs)
+    return(test_result$p.value)
+  }
+}
+```
+
+```{r}
+########### Phenotype Module Scores
+# Apply the function to each column except the first (sample)
+df = SamOG.seurat@meta.data %>%
+  select(sample, GetScoreNames(AllMarkers))
+p_values <- sapply(names(df)[-1], function(col_name) {
+  perform_t_test(df, col_name, "sample")
+})
+# Adjust these p-values using the BH method
+adjusted_p_values <- p.adjust(p_values, method = "BH")
+
+# Print adjusted p-values
+print(adjusted_p_values)
+barplot(-log(adjusted_p_values))
+# # Output the results
+# print(p_values)
+```
+
+```{r}
+########### Markers
+# Apply the function to each column except the first (sample)
+filtered_markers = unlist(AllMarkers)[unlist(AllMarkers) %in% rownames(SamOG.seurat)]
+df = cbind(sample = SamOG.seurat$sample, as.data.frame(t(SamOG.seurat[["RNA"]]$data[filtered_markers,])))
+p_values <- sapply(names(df)[-1], function(col_name) {
+  perform_t_test(df, col_name, "sample")
+})
+# Adjust these p-values using the BH method
+adjusted_p_values <- p.adjust(p_values, method = "BH")
+
+# Print adjusted p-values
+print(adjusted_p_values)
+adjusted_p_values = as.data.frame(adjusted_p_values)
+adjusted_p_values$genes = rownames(adjusted_p_values)
+adjusted_p_values %>%
+  mutate(logpadj = -log(adjusted_p_values)) %>%
+  arrange(desc(logpadj)) %>%
+  mutate(genes = factor(genes, levels = unique(genes))) %>%
+  ggplot(aes(x=genes, y=logpadj))+
+  geom_col()+
+  coord_flip()
+
+# For the different phenotypes, is there a prevalent phenotype in one vs the other?
+#   For EPI_ICM, we observe higher variability in nPSCs than in EPSCs, which genes define the polarity?
+#   How does the EPI_ICM variability influence the development of blastoids?
+#   Can we quantify how the EPI_ICM varies between the blastoids?
+#   -EPI_ICM_epsc
+# -EPI_ICM_npsc
+# -EPI_ICM_npsc_high
+# -EPI_ICM_npsc_low
+
+```
+

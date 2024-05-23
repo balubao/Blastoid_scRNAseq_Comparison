@@ -1,0 +1,1545 @@
+---
+title: "Annotation_supplementary"
+output: html_document
+date: "2024-02-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+# Supplementary file
+
+## Comment from Reviewer
+The authors have summarized the differences in specific cell types among various 
+blastoids in terms of their similarity to human embryo data. 
+It is worth considering further analysis of the differences in specific 
+cell types within blastoids that exhibit larger discrepancies when compared to embryo data. 
+
+In response to the reviwer's request, we identify the cells most corresponding to natural blastocyst in the blastoid data.
+
+```{r}
+# set-up
+
+# renv::deactivate()
+# setwd('/home/balubao/Documents/Research/blastoid_comparison/')
+source("script/Initiation.R")
+```
+
+```{r}
+# parallel setup
+# lapply(c("parallel", "doParallel", "foreach"), library, character.only = T)
+# clust <- makeCluster(4)
+# registerDoParallel(cl)
+
+library("parallel")
+```
+
+```{r} 
+# label single cells
+library(SingleR) # poor scaling
+# correlates (spearman) each cell transcriptome to refernce transcriptome (pure-celltype bulk).
+
+library(scmap)
+
+# marker-based annotation
+library(AUCell) # doesn't work well with small gene lists (10-15 genes)
+library(SCINA) #
+# library(GSEA) #similar to AUCell in mechanism, assumed to also require large gene set
+```
+
+## Load datasets
+```{r}
+# Integrated.seurat = LoadH5Seurat("intregrated_all_final.h5seurat")
+# seurat.list = SplitObject(Integrated.seurat, split.by = "sample")
+seurat.list <- readRDS("02_preprocessing/results/blastoid_integration_list_deconstructed.rds")
+```
+
+
+
+## marker-based annotation (SCINA, AUCell)
+We append GATA6 to our list as a recognized marker of hypobast cells.
+
+```{r}
+# get scores
+geneSet <- GetSCTypeMarkers(tissueType = "Embryo_Sam2_set1")
+geneSet$PE <- append(geneSet$PE, "GATA6")
+
+for (i in seq_along(seurat.list)) {
+  DefaultAssay(seurat.list[[i]]) <- "SCT"
+  seurat.list[[i]] <- GetResidual(seurat.list[[i]], features = unlist(geneSet))
+}
+```
+
+## METHOD 1: SCINA
+<!-- https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6678337/#app1-genes-10-00531 -->
+
+SCINA is a semi-supervised methods which requires list of signature genes (one or more signature (not markers) per celltype).
+It assumes a bimodal expression of the signature genes in the normalized expression matrix.
+
+```{r SCINA method}
+require(SCINA)
+
+# clusterExport(clust, "geneSet")
+
+# annotate by scina and generate results
+results_scina.list <- mclapply(
+  X = seurat.list,
+  mc.cores = 6,
+  FUN = function(seurat_object) {
+    # annotate references
+    # signatures = preprocess.signatures(file_path = ) #turn gene list to SCINA workable list
+    expr <- GetAssayData(seurat_object, assay = "SCT", layer = "scale.data")
+
+    results_scina <- SCINA(expr, geneSet, rm_overlap = FALSE) # process, do not remove overlapping markers
+
+    return(results_scina)
+  }
+)
+
+# save(results_scina.list, file = "scina_results_sample_list.rda")
+load("scina_results_sample_list.rda")
+
+# plot scina results
+for (i in seq_along(seurat.list)) {
+  expr <- GetAssayData(seurat.list[[i]], assay = "SCT", layer = "data")
+
+  select_c <- which(colnames(expr) %in% sample(colnames(expr), min(1500, ncol(expr))))
+  results_scina_sub <- results_scina.list[[i]]
+  results_scina_sub$cell_labels <- results_scina_sub$cell_labels[select_c]
+  results_scina_sub$probabilities <- results_scina_sub$probabilities[, select_c]
+
+  plotheat.SCINA(expr[, select_c], results_scina_sub, geneSet) # plot results
+  title(names(seurat.list)[i])
+}
+
+## transfer result_scina labels to seurat_objects
+seurat.list <- lapply(seq_along(seurat.list), function(seurat_object) {
+  seurat.list[[i]]$annot_scina <- results_scina.list[[i]]$cell_labels
+  return(seurat.list[[i]])
+})
+```
+
+## METHOD 2: AUCell
+<!-- https://www.nature.com/articles/nmeth.4463#Sec2 -->
+
+AUCell uses a ranking approach to determine prevalence of markers in each cell.
+It is independent of unit and normalization procedure, but requires large gene lists for reliable annotation.
+While our gene lists are small, we test the annotation with AUCell.
+AUCell computes the AUC under the recovery curve.
+
+```{r AUCell method}
+require(AUCell)
+
+seurat_object <- seurat.list[[1]]
+
+# annotate by aucell and generate results
+results_aucell.list <- mclapply(
+  X = seurat.list,
+  mc.cores = 5,
+  FUN = function(seurat_object) {
+    expr <- GetAssayData(seurat_object, assay = "SCT", layer = "data")
+
+    # Running AUCell
+    cells_rankings <- AUCell_buildRankings(expr, plotStats = F)
+    cells_AUC <- AUCell_calcAUC(geneSet, cells_rankings, aucMaxRank = 0.1 * nrow(cells_rankings)) # we use top10% of genes to compute signature
+
+    results_aucell <- AUCell_exploreThresholds(cells_AUC, assignCells = T, plotHist = F) # expect 1% of cells to be outliers for null (thrP=0.01). nCells is the minimum expected cells in
+    # which threshold to use?
+    # minimumDens - inlfection point of the density curve. Good for bimodal dist, not if many cells have activate marker
+    # L_2k - left of distribution, adjust AUC as mixture of 2 distributions, sets threshold to 1-thrP/nCells
+    # R_k3 - right of distribution, adjust AUC as mixture of 3 distributions sets threshold to thrP.
+    # Global_k1 - uses global distribution, and sets threshold to 1-thrP/nCells
+
+    # assignCells=TRUE selects the largest threshold. But it is recommended to manually select the thresholds,
+    # especially if low number of genes, to avoid low thresholds.
+
+    return(results_aucell)
+  }
+)
+
+for (j in seq_along(seurat.list)) {
+  ## diagnostics panel
+  message_str <- paste0("\n#############\n", unique(seurat.list[[j]]$sample), "\n#############\n")
+  cat(message_str)
+  tmp <- lapply(seq_along(results_aucell.list[[j]]), function(i) {
+    # print()
+    results_score <- results_aucell.list[[j]][[i]]
+    message_str <- paste0(
+      "\nFor ", names(results_aucell.list[[j]])[i], " score:\n",
+      "The selected threshold: ", results_score$aucThr$selected, "\n",
+      "Additional comments: ", results_score$aucThr$comment, "\n\n",
+      "The thresholds are (cells selected by each): \n"
+    )
+
+    cat(message_str)
+    print(results_score$aucThr$thresholds)
+    cat("\n*************")
+  })
+}
+
+save(results_aucell.list, file = "aucell_results_sample_list.rda")
+
+## transfer result_aucell labels to seurat_objects
+for (j in seq_along(seurat.list)) {
+  results_aucell <- results_aucell.list[[j]]
+
+  ## assign labels
+  cell_labels <- rep("unknown", ncol(expr))
+  for (i in seq_along(results_aucell)) {
+    cell_idx <- colnames(expr) %in% results_aucell[[i]]$assignment # which cells assigned label?
+    cell_labels[cell_idx] <- names(results_aucell)[i] # assign label to those cells
+  }
+
+  seurat.list[[j]]$annot_aucell <- cell_labels
+}
+```
+After assessing the diagnostic panel, we determine AUCell to not perform well - and therefore exclude it from downstream analysis steps. This is not surprising since the gene set was small, which is discouraged for this particular method.
+
+
+## METHOD 3: SCType
+<!-- https://www.nature.com/articles/s41467-022-28803-w -->
+The main contribution lies in assembly of a database from other references, and filtering for reliability. 
+It also explicitly takes overlapping markers into consideration for scoring by penalizing by a specificity score.
+It uses a normalized sum of the positive and negative expression of z-scored genes. 
+
+```{r}
+library(parallel)
+
+# set up params
+assay <- "SCT"
+db <- "~/Documents/Research/blastoid_comparison/data/ScTypeDB_full.xlsx"
+tissue <- "Embryo_Sam2_set1"
+
+## load libraries and functions
+lapply(c("dplyr", "Seurat", "HGNChelper"), library, character.only = T)
+# load gene set preparation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+# load cell type annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+
+# prepare gene sets
+gs_list <- gene_sets_prepare(db, tissue)
+
+results_sctype.list <- mclapply(
+  X = seurat.list,
+  mc.cores = 5,
+  FUN = function(seurat.data) {
+    # get cell-type by cell matrix
+    es.max <- sctype_score(
+      scRNAseqData = seurat.data[[assay]]@scale.data, scaled = TRUE,
+      gs = gs_list$gs_positive, gs2 = gs_list$gs_negative
+    )
+
+    rownames(es.max) <- names(geneSet)
+    # NOTE: scRNAseqData parameter should correspond to your input scRNA-seq matrix.
+    # In case Seurat is used, it is either seurat.data[["RNA"]]@scale.data (default), seurat.data[["SCT"]]@scale.data, in case sctransform is used for normalization,
+    # or seurat.data[["integrated"]]@scale.data, in case a joint analysis of multiple single-cell datasets is performed.
+
+    return(es.max)
+  }
+)
+
+save(results_sctype.list, file = "sctype_results_sample_list.rda")
+
+seurat.list <- mclapply(
+  X = seq_along(seurat.list),
+  mc.cores = 5,
+  FUN = function(i) {
+    ## Get relevant list objects
+    seurat.data <- seurat.list[[i]]
+    es.max <- results_sctype.list[[i]]
+
+    #########
+    ## generate labels for clusters
+    # THERE IS APROBLEM WITH tHE SORT HERE FOR SOME OF THE DATASETS
+    es.max_cL.ls <- lapply(unique(seurat.data@meta.data$seurat_clusters), function(cl) {
+      # sum es.max for all cells from cluster cl, and sort by value
+      es.max.cl <- sort(rowSums(es.max[, rownames(seurat.data@meta.data[seurat.data@meta.data$seurat_clusters == cl, ]), drop = FALSE]), decreasing = !0)
+
+      # display cluster, ex.max scores for each celltype, and number of cells in the cluster.
+      head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(seurat.data@meta.data$seurat_clusters == cl)), 10)
+    })
+
+    # merge by cluster
+    cL_resutls <- do.call("rbind", es.max_cL.ls)
+
+    # assign top score to each cluster
+    sctype_scores <- cL_resutls %>%
+      group_by(cluster) %>%
+      top_n(n = 1, wt = scores)
+
+    # set low-confident (low ScType score) clusters to "unknown" - less than a quarter of cells in a cluster
+    sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells / 4] <- "unknown"
+    # print(sctype_scores[,1:3])
+
+    # transfer celltype labels to seurat object by cluster
+    labname <- "annot_sctype_clust"
+    seurat.data@meta.data[labname] <- ""
+    for (j in unique(sctype_scores$cluster)) {
+      cl_type <- sctype_scores[sctype_scores$cluster == j, ]
+      seurat.data@meta.data[, labname][seurat.data@meta.data$seurat_clusters == j] <- as.character(cl_type$type[1])
+    }
+
+
+    #########
+    # generate labels for cells
+    label_idx <- apply(X = es.max, MARGIN = 2, which.max)
+    # we assign the label of the highest score
+    sctype_scores_cell <- rownames(es.max)[label_idx]
+
+    # if the highest score is <0, we assign as unknown
+    select_unknown <- apply(X = es.max, MARGIN = 2, max) > 0
+    sctype_scores_cell[select_unknown] <- "unknown"
+
+    labname <- "annot_sctype_cell"
+    seurat.data@meta.data[labname] <- sctype_scores_cell
+
+    return(seurat.data)
+  }
+)
+```
+
+## Cross-Method Analysis
+```{r}
+summ_annot.list <- lapply(seq_along(seurat.list), function(i) {
+  annot_vecs <- grep("annot_", colnames(seurat.list[[i]]@meta.data), value = TRUE)
+  annot_meta <- seurat.list[[i]]@meta.data[, annot_vecs]
+  summ_annot <- apply(annot_meta, 2, table)
+  if (is.matrix(summ_annot)) {
+    summ_annot <- t(summ_annot)
+    rownames(summ_annot) <- sub(pattern = "annot_", replacement = "", rownames(summ_annot))
+    summ_annot <- as.data.frame(summ_annot)
+    return(summ_annot)
+  } else {
+    summ_annot <- lapply(summ_annot, function(x) as.list(x))
+    summ_annot <- rbindlist(summ_annot, fill = TRUE)
+    summ_annot <- as.data.frame(summ_annot)
+    rownames(summ_annot) <- sub(pattern = "annot_", replacement = "", annot_vecs)
+    return(summ_annot)
+  }
+})
+
+names(summ_annot.list) <- sapply(seurat.list, function(x) unique(x$sample))
+
+# print(summ_annot.list)
+
+tmp.list <- lapply(summ_annot.list, function(summ_annot) {
+  summ_annot["method"] <- rownames(summ_annot)
+  summ_annot <- reshape2::melt(summ_annot)
+  return(summ_annot)
+})
+
+summ_annot_df <- rbindlist(tmp.list, use.names = TRUE, idcol = TRUE)
+# summ_annot_df = summ_annot_df[!is.na(summ_annot_df$value),]
+summ_annot_df <- summ_annot_df[summ_annot_df$method %in% c("aucell", "scina", "sctype_cell", "sctype_clust"), ]
+summ_annot_df <- summ_annot_df[summ_annot_df$variable %in% unique(summ_annot_df$variable[!is.na(summ_annot_df$value)]), ]
+summ_annot_df <- summ_annot_df %>%
+  group_by(.id, method) %>%
+  mutate(prop = value / sum(value, na.rm = T))
+
+require(viridis)
+summ_annot_df$Annotation <- factor(summ_annot_df$variable)
+summ_annot_df$method <- factor(summ_annot_df$method)
+levels(summ_annot_df$method) <- c("AUCell", "SCINA", "SCType_cell", "SCType_clust")
+# ggplot(summ_annot_df, aes(x=variable, y=prop, fill=method))+
+#   geom_col(position = "dodge")+
+#   scale_fill_viridis(discrete = T, option = "H") +
+#   facet_wrap(~.id)+
+#   coord_flip()+
+#   theme(axis.text.x = element_text(size = 5))
+
+ggplot(summ_annot_df, aes(x = method, y = prop, fill = Annotation)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis(discrete = T, option = "H") +
+  facet_wrap(~.id) +
+  ylab("Cell Proprtions") +
+  xlab("Marker-based Methods") +
+  coord_flip() +
+  theme(axis.text.x = element_text(size = 5))
+```
+We compare the results for the marker-based methods. We find that AUCell fails to characterize many cells across many datasets. This comes as no surprize since our gene list is quite short, with 6, 4, 3 for EPI_ICM, PE, and TE respectively. While it is advised to revise the thresholds manually to mitigate the issue, we then fall into the issue of how to make a fair thresholding between the different datasets. Additionally, the method already followed a heuristic of choosing the highest threshold. SCType was implemented for each cell, but also has many cells annotated as "unknown", even in reference datasets. This could be attributed to the noisy nature of single-cell RNAseq. To correct for the noise, SCType uses cluster assignment, which we also implement as SCType_clust. The results show a reduction of "unknown" assignments. Similarly, SCINA performs well in assigning cells labels, and shows similar proportions of "unknown" cells as that observed for SCType_clust. We therefore proceed with results from SCType_clust and SCINA to validate against the annotations of the original publications.
+
+
+## QC References -
+### compare references-markers to references-original
+To validate the annotations, we compare to the annotations made in the original publication.
+We have 3 reference datasets, Petropoulos2016_ref, Xiang2020_ref, and Yanagida2021_ref.
+Annotation assignment was reported in the original publications as follows:
+1. Petropoulos2016_ref: segregation by time, identification of PC with high separation of lineage relevant markers. hierarchical clustering of most vairable genes.
+2. Xiang2020_ref:
+3. Yanagida2021_ref:
+
+*all information was retrieved from the accession IDs provided in the original publication
+
+```{r}
+sample_names <- sapply(seurat.list, function(x) unique(x$sample))
+names(seurat.list) <- sample_names
+seurat_list_ref <- seurat.list[grep("_ref", sample_names)]
+
+# retrieve labels, and how annotation was made for each.
+i <- "Petropoulos2016_ref"
+# petro_meta = read.table("../Data/Petropoulos2016/E-MTAB-3929.sdrf.txt", sep="\t", header = TRUE)
+# rownames(petro_meta) = paste0(petro_meta$Comment.ENA_RUN.,"_",petro_meta$Source.Name)
+# write.table(petro_meta, sep = "\t", file = "../Data/Petropoulos2016/meta_data.txt", col.names = TRUE, row.names = TRUE)
+petro_meta <- read.table("../Data/Petropoulos2016/meta_data.txt", sep = "\t", header = TRUE, row.names = 1)
+
+ord_idx <- match(colnames(seurat_list_ref[[i]]), rownames(petro_meta))
+seurat_list_ref[[i]]$label1_annot <- petro_meta$Characteristics.inferred.lineage.[ord_idx]
+seurat_list_ref[[i]]$label2_annot <- petro_meta$Characteristics.inferred.trophectoderm.subpopulation.[ord_idx]
+
+# library(GEOquery)
+i <- "Xiang2020_ref"
+# gds = getGEO(GEO = "GSE136447")
+# pdata_ls = lapply(gds, pData)
+# xiang_meta = do.call("rbind", pdata_ls)
+# xiang_meta = xiang_meta[,c("title", "geo_accession", "age:ch1", "cell type:ch1","source_name_ch1", "organism_ch1", "characteristics_ch1", "relation", "relation.1")]
+# xiang_meta2 = read.table("../Data/Xiang2020/PRJNA562548_Xiang2020.txt", sep = "\t", header = TRUE)
+# xiang_meta$run_accession = xiang_meta2$run_accession[match(xiang_meta$title, xiang_meta2$sample_title)]
+# rownames(xiang_meta) = paste0(xiang_meta$run_accession,"_",xiang_meta$title)
+# write.table(xiang_meta, sep = "\t", file = "../Data/Xiang2020/meta_data.txt", col.names = TRUE, row.names = TRUE)
+xiang_meta <- read.table("../Data/Xiang2020/meta_data.txt", sep = "\t", header = TRUE, row.names = 1)
+
+ord_idx <- match(colnames(seurat_list_ref[[i]]), rownames(xiang_meta))
+seurat_list_ref[[i]]$label1_annot <- xiang_meta$cell.type.ch1[ord_idx]
+seurat_list_ref[[i]]$label2_annot <- xiang_meta$age.ch1[ord_idx]
+
+i <- "Yanagida2021_ref"
+# gds = getGEO(GEO = "GSE171820")
+# yana_meta = pData(gds[[1]])
+# yana_meta2 = read.table("../Data/Yanagida2021/PRJNA720968_Yanagida2021.txt", sep = "\t", header = TRUE)
+# yana_meta$run_accession = yana_meta2$run_accession[match(yana_meta$title, yana_meta2$sample_title)]
+# rownames(yana_meta) = paste0(yana_meta$run_accession,"_",yana_meta$title)
+# write.table(yana_meta, sep = "\t", file = "../Data/Yanagida2021/meta_data.txt", col.names = TRUE, row.names = TRUE)
+yana_meta <- read.table("../Data/Yanagida2021/meta_data.txt", sep = "\t", header = TRUE, row.names = 1)
+
+ord_idx <- match(colnames(seurat_list_ref[[i]]), rownames(yana_meta))
+seurat_list_ref[[i]]$label1_annot <- yana_meta$lineage.ch1[ord_idx]
+seurat_list_ref[[i]]$label2_annot <- yana_meta$polar_mural.ch1[ord_idx]
+
+
+#############################
+## generate a DF with method, celltype, annotation, and frequency for each reference dataset
+summ_annot.list <- lapply(seq_along(seurat_list_ref), function(i) {
+  annot_vecs <- grep("annot_", colnames(seurat_list_ref[[i]]@meta.data), value = TRUE)
+  annot_meta <- seurat_list_ref[[i]]@meta.data[, annot_vecs]
+  summ_annot <- apply(annot_meta, 2, function(x) table(seurat_list_ref[[i]]$label1_annot, x))
+
+  summ_annot <- lapply(summ_annot, function(x) as.data.frame(x))
+  summ_annot <- rbindlist(summ_annot, fill = TRUE, use.names = TRUE, idcol = TRUE)
+  summ_annot <- as.data.frame(summ_annot)
+  summ_annot$.id <- sub(pattern = "annot_", replacement = "", summ_annot$.id)
+  return(summ_annot)
+})
+
+# assign reference name to list item
+names(summ_annot.list) <- sapply(seurat_list_ref, function(x) unique(x$sample))
+
+# keep seperated since original data has different labels
+plts <- lapply(seq_along(summ_annot.list), function(i) {
+  summ_annot_df <- summ_annot.list[[i]]
+  summ_annot_df <- summ_annot_df[summ_annot_df$.id %in% c("aucell", "pub", "scina", "sctype_cell", "sctype_clust"), ]
+  summ_annot_df <- summ_annot_df %>%
+    group_by(.id, Var1) %>%
+    mutate(Proportions = round(Freq / sum(Freq, na.rm = T), digits = 1))
+
+  require(viridis)
+  summ_annot_df$Predicted_Annot <- summ_annot_df$x
+  summ_annot_df$Published_Annot <- summ_annot_df$Var1
+  summ_annot_df$Method <- factor(summ_annot_df$.id)
+  levels(summ_annot_df$Method) <- c("AUCell", "Published", "SCINA", "SCType_cell", "SCType_clust")
+
+  summ_annot_df <- summ_annot_df[summ_annot_df$Method %in% c("SCINA", "SCType_clust"), ]
+
+  plt <- ggplot(summ_annot_df, aes(x = Predicted_Annot, y = Published_Annot, fill = Proportions)) +
+    geom_tile(color = "white") +
+    scale_fill_distiller(palette = "Purples", direction = 1)+
+    # scale_fill_distiller(palette = "YlOrBr")+
+    # scale_fill_gradient(low = "purple", high = "skyblue", space="Lab")+
+    # scale_fill_viridis(option = "plasma") +
+    facet_wrap(~Method) +
+    ylab("Published Annotation Labels") +
+    xlab("Predicted Annotation Labels") +
+    ggtitle(names(summ_annot.list)[i]) +
+    theme_minimal() + # minimal theme
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+    coord_fixed()
+
+  plt
+  
+  return(plt)
+})
+
+wrap_plots(plts, ncol = 1)
+ggsave("03_annotation/figures/marker_based_annot_verify_w_published.svg", width = 8, height = 11)
+```
+To validate the predicted annotations, we contrast to the published annotations. To do so, we view the proportions of published labels across the predicted labels (sum of each row is 1). We observe that SCType has better cell label recovery. SCINA results appear less resolved and more dispersed. Although, SCINA seems more specific (more false negatives), whereas SCType appears to be more sensitive (more false positives). We therefore validate the labels generated by SCType_clust, and extend to the blastoid models.
+
+**An additional step would be to test the stability given the markers - such that if one marker was droped, how much would that change the annotations. 
+
+```{r}
+## could revise the labels to minimize redundancy
+seurat_list_ref$Petropoulos2016_ref$annot_pub <- factor(seurat_list_ref$Petropoulos2016_ref$label1_annot)
+levels(seurat_list_ref$Petropoulos2016_ref$annot_pub) <- c(
+  "epiblast",
+  "not applicable",
+  "primitive endoderm",
+  "trophectoderm"
+)
+
+seurat_list_ref$Yanagida2021_ref$annot_pub <- factor(seurat_list_ref$Yanagida2021_ref$label1_annot)
+levels(seurat_list_ref$Yanagida2021_ref$annot_pub) <- c(
+  "Early Trophectoderm",
+  "Epiblast",
+  "Inner Cell Mass",
+  "Inner Cell Mass-Trophectoderm Transition",
+  "Primitive Endoderm",
+  "Trophectoderm",
+  "Unknown"
+)
+
+seurat_list_ref$Xiang2020_ref$annot_pub <- factor(seurat_list_ref$Xiang2020_ref$label1_annot)
+levels(seurat_list_ref$Xiang2020_ref$annot_pub) <- c(
+  "CTBs",
+  "EPI",
+  "Hypoblast",
+  "ICM"
+)
+
+# reassign reference datasets with modified labels.
+ord_idx <- match(names(seurat_list_ref), names(seurat.list))
+seurat.list[ord_idx] <- seurat_list_ref
+```
+
+
+#############
+# for a dataset, annotate based on each reference independently
+#############
+Another flavor of annotation is reference-based annotation Integration based annotation. Reference-based methods require a well annotated reference, usually done by experts in their respective fields. However, some challenges include batch effects, propogation of errors in the reference, and choice of ill-matched reference. To address these challenges in our work, we combine with marker-based annotation (see previous section), select approriate references with appropriate time frames (D5-D7 peri-implantation blastocyst data), and compare marker-based annotation of references to original annotation, which we show in the previous section.
+
+Here, we use 2 methods, scmap and singleR (based on inouse reference). 
+<!-- and a self-trained classifier (SVM, RandForest). -->
+
+## METHOD 1: SCMAP
+<!-- https://www.nature.com/articles/nmeth.4644 -->
+projects cells onto the reference, which for the 'cluster' approach, consists of the centroids of the different clusters, with each represented as the median gene expression value of all cells in the cluster.
+Features are then selected (by HVG or higher dropouts by M3Drop). Similarity is measured using cosine similarity, spearman and pearson correlation. At least 2 similarity measures should be in agreement, and one >0.7. Otherwise, the cell is labeled as unassigned. Another, the 'cell' based approach, uses a kNN based on cosine similarity, and assigns the label if at least 3 neighbours have the same label, with similarity >0.5. In the section below, we attempt both. "cell" is better used for continuos trajectory identities.
+
+### SCMAP-cluster
+```{r}
+require(scmap)
+require(SingleCellExperiment)
+
+# seurat_object = seurat.list[[1]]
+
+# generate reference index for all reference datasets
+sce_list_ref <- mclapply(seurat_list_ref, mc.cores = 5, function(seurat_object) {
+  sce <- SingleCellExperiment(assays = list(normcounts = GetAssayData(seurat_object, assay = "SCT", layer = "data")), colData = seurat_object@meta.data)
+  logcounts(sce) <- normcounts(sce) # counts already normalized, but slot used downstream
+
+  # use gene names as feature symbols
+  rowData(sce)$feature_symbol <- rownames(sce)
+
+  sce <- selectFeatures(sce, suppress_plot = TRUE)
+  table(rowData(sce)$scmap_features)
+
+  sce <- indexCluster(sce, cluster_col = "annot_pub") # create centroids
+  # heatmap(as.matrix(metadata(sce)$scmap_cluster_index))
+
+  return(sce)
+})
+
+# annotate datasets from all references (cluster)
+seurat.list <- mclapply(seurat.list, mc.cores = 5, function(seurat_object) {
+  sce <- SingleCellExperiment(assays = list(normcounts = GetAssayData(seurat_object, assay = "SCT", layer = "data")), colData = seurat_object@meta.data)
+  logcounts(sce) <- normcounts(sce) # counts already normalized, but slot used downstream
+
+  # use gene names as feature symbols
+  rowData(sce)$feature_symbol <- rownames(sce)
+
+  sce <- selectFeatures(sce, suppress_plot = TRUE)
+
+  scmapCluster_results <- scmapCluster(
+    projection = sce,
+    index_list = list(
+      petro = metadata(sce_list_ref$Petropoulos2016_ref)$scmap_cluster_index,
+      yana = metadata(sce_list_ref$Yanagida2021_ref)$scmap_cluster_index,
+      xiang = metadata(sce_list_ref$Xiang2020_ref)$scmap_cluster_index
+    )
+  )
+
+  seurat_object$annot_scmap_clust_p <- scmapCluster_results$scmap_cluster_labs[, "petro"]
+  seurat_object$annot_scmap_clust_y <- scmapCluster_results$scmap_cluster_labs[, "yana"]
+  seurat_object$annot_scmap_clust_x <- scmapCluster_results$scmap_cluster_labs[, "xiang"]
+
+  seurat_object$annot_scmap_clust <- scmapCluster_results$combined_labs
+  return(seurat_object)
+})
+
+# generate reference index for all reference datasets - SCType-clusters markers
+sce_list_ref_mrk <- lapply(seurat_list_ref, function(seurat_object) {
+  sce <- SingleCellExperiment(assays = list(normcounts = GetAssayData(seurat_object, assay = "SCT", layer = "data")), colData = seurat_object@meta.data)
+  logcounts(sce) <- normcounts(sce) # counts already normalized, but slot used downstream
+
+  # use gene names as feature symbols
+  rowData(sce)$feature_symbol <- rownames(sce)
+
+  sce <- selectFeatures(sce, suppress_plot = TRUE)
+  table(rowData(sce)$scmap_features)
+
+  sce <- indexCluster(sce, cluster_col = "annot_sctype_clust") # create centroids
+  # heatmap(as.matrix(metadata(sce)$scmap_cluster_index))
+
+  return(sce)
+})
+
+# annotate datasets from all references (cluster) - SCType-clusters markers
+seurat.list <- lapply(seurat.list, function(seurat_object) {
+  sce <- SingleCellExperiment(assays = list(normcounts = GetAssayData(seurat_object, assay = "SCT", layer = "data")), colData = seurat_object@meta.data)
+  logcounts(sce) <- normcounts(sce) # counts already normalized, but slot used downstream
+
+  # use gene names as feature symbols
+  rowData(sce)$feature_symbol <- rownames(sce)
+
+  sce <- selectFeatures(sce, suppress_plot = TRUE)
+
+  scmapCluster_results <- scmapCluster(
+    projection = sce,
+    index_list = list(
+      petro = metadata(sce_list_ref_mrk$Petropoulos2016_ref)$scmap_cluster_index,
+      yana = metadata(sce_list_ref_mrk$Yanagida2021_ref)$scmap_cluster_index,
+      xiang = metadata(sce_list_ref_mrk$Xiang2020_ref)$scmap_cluster_index
+    )
+  )
+
+  seurat_object$annot_scmap_clust_p_mrk <- scmapCluster_results$scmap_cluster_labs[, "petro"]
+  seurat_object$annot_scmap_clust_y_mrk <- scmapCluster_results$scmap_cluster_labs[, "yana"]
+  seurat_object$annot_scmap_clust_x_mrk <- scmapCluster_results$scmap_cluster_labs[, "xiang"]
+
+  seurat_object$annot_scmap_clust_mrk <- scmapCluster_results$combined_labs
+  return(seurat_object)
+})
+
+# plot(
+#   getSankey(
+#     colData(sce)$label1,
+#     scmapCluster_results$combined_labs,
+#     plot_height = 400
+#   )
+# )
+```
+
+Cohen's kappa, quanitifies mapping accuracy.
+
+### SCMAP-cell
+```{r}
+set.seed(1) # fix for stochasticity
+
+# generate list from previous step (cluster)
+sce_list_ref <- lapply(sce_list_ref, function(sce) {
+  return(indexCell(sce))
+}) # sub-quantized by kmeans approach (subcentroids of subclusters)
+# we use default settings (k=sqrt(N), f=500, M=f/10=50)
+
+# annotate datasets from all references (cell)
+seurat.list <- lapply(seurat.list, function(seurat_object) {
+  sce <- SingleCellExperiment(assays = list(normcounts = GetAssayData(seurat_object, assay = "SCT", layer = "data")), colData = seurat_object@meta.data)
+  logcounts(sce) <- normcounts(sce) # counts already normalized, but slot used downstream
+
+  # use gene names as feature symbols
+  rowData(sce)$feature_symbol <- rownames(sce)
+
+  sce <- selectFeatures(sce, suppress_plot = TRUE)
+
+  # assign subcluster indices to each cell, include top k neighbours
+  scmapCell_results <- scmapCell(
+    projection = sce,
+    index_list = list(
+      petro = metadata(sce_list_ref$Petropoulos2016_ref)$scmap_cell_index,
+      yana = metadata(sce_list_ref$Yanagida2021_ref)$scmap_cell_index,
+      xiang = metadata(sce_list_ref$Xiang2020_ref)$scmap_cell_index
+    )
+  )
+
+  # check top 3 neighbour cell labels, and assign if the same.
+  scmapCell_clusters <- scmapCell2Cluster(
+    scmapCell_results,
+    list(
+      petro = as.character(colData(sce_list_ref$Petropoulos2016_ref)$annot_pub),
+      yana = as.character(colData(sce_list_ref$Yanagida2021_ref)$annot_pub),
+      xiang = as.character(colData(sce_list_ref$Xiang2020_ref)$annot_pub)
+    )
+  ) # use default threshold = 0.5
+
+  # transfer for each reference
+  seurat_object$annot_scmap_cell_p <- scmapCell_clusters$scmap_cluster_labs[, "petro"]
+  seurat_object$annot_scmap_cell_y <- scmapCell_clusters$scmap_cluster_labs[, "yana"]
+  seurat_object$annot_scmap_cell_x <- scmapCell_clusters$scmap_cluster_labs[, "xiang"]
+
+  seurat_object$annot_scmap_cell <- scmapCell_clusters$combined_labs
+
+
+  return(seurat_object)
+})
+
+# generate list from previous step (cluster) - SCType-clusters markers
+sce_list_ref_mrk <- lapply(sce_list_ref_mrk, function(sce) {
+  return(indexCell(sce))
+}) # sub-quantized by kmeans approach (subcentroids of subclusters)
+# we use default settings (k=sqrt(N), f=500, M=f/10=50)
+
+# annotate datasets from all references (cell) - SCType-clusters markers
+seurat.list <- lapply(seurat.list, function(seurat_object) {
+  sce <- SingleCellExperiment(assays = list(normcounts = GetAssayData(seurat_object, assay = "SCT", layer = "data")), colData = seurat_object@meta.data)
+  logcounts(sce) <- normcounts(sce) # counts already normalized, but slot used downstream
+
+  # use gene names as feature symbols
+  rowData(sce)$feature_symbol <- rownames(sce)
+
+  sce <- selectFeatures(sce, suppress_plot = TRUE)
+
+  # assign subcluster indices to each cell, include top k neighbours
+  scmapCell_results <- scmapCell(
+    projection = sce,
+    index_list = list(
+      petro = metadata(sce_list_ref_mrk$Petropoulos2016_ref)$scmap_cell_index,
+      yana = metadata(sce_list_ref_mrk$Yanagida2021_ref)$scmap_cell_index,
+      xiang = metadata(sce_list_ref_mrk$Xiang2020_ref)$scmap_cell_index
+    )
+  )
+
+  # check top 3 neighbour cell labels, and assign if the same.
+  scmapCell_clusters <- scmapCell2Cluster(
+    scmapCell_results,
+    list(
+      petro = as.character(colData(sce_list_ref_mrk$Petropoulos2016_ref)$annot_sctype_clust),
+      yana = as.character(colData(sce_list_ref_mrk$Yanagida2021_ref)$annot_sctype_clust),
+      xiang = as.character(colData(sce_list_ref_mrk$Xiang2020_ref)$annot_sctype_clust)
+    )
+  ) # use default threshold = 0.5
+
+  # transfer for each reference
+  seurat_object$annot_scmap_cell_p_mrk <- scmapCell_clusters$scmap_cluster_labs[, "petro"]
+  seurat_object$annot_scmap_cell_y_mrk <- scmapCell_clusters$scmap_cluster_labs[, "yana"]
+  seurat_object$annot_scmap_cell_x_mrk <- scmapCell_clusters$scmap_cluster_labs[, "xiang"]
+
+  seurat_object$annot_scmap_cell_mrk <- scmapCell_clusters$combined_labs
+
+
+  return(seurat_object)
+})
+```
+After implementing scmap-cluster and scmap-cell, we also implement singleR.
+
+## METHOD 2: SingleR
+SingleR is a reference-based method which labels at the cell level. It uses a modified kNN classifier, which relies on spearman correlation to compute simmilarity, where it is only measured on the union of features between the query and the reference. It includes a quantile normalization of the scores to address the issue of unbalanced sample labels, which vanilla kNN would be impacted by. It also allows the successful annotation with a minority of similar cells. 
+
+```{r}
+# Performing predictions.
+library(SingleR)
+library(BiocParallel)
+
+## pretraining - challenging since different datasets would need different genes.
+# trained <- trainSingleR(ref = sce_list_ref,
+#                         labels = list(
+#                           petro = sce_list_ref$Petropoulos2016_ref$annot_pub,
+#                           yana = sce_list_ref$Yanagida2021_ref$annot_pub,
+#                           xiang = sce_list_ref$Xiang2020_ref$annot_pub),
+#                         de.method ="wilcox", de.n=30, aggr.ref=TRUE)
+
+# annotate datasets from all references (cell) - use published annot (non-harmonized)
+seurat.list <- lapply(seurat.list, function(seurat_object) {
+  sce <- SingleCellExperiment(assays = list(normcounts = GetAssayData(seurat_object, assay = "SCT", layer = "data")), colData = seurat_object@meta.data)
+  logcounts(sce) <- normcounts(sce) # counts already normalized, but slot used downstream
+
+  # use gene names as feature symbols
+  rowData(sce)$feature_symbol <- rownames(sce)
+
+  # generate predictions
+  predictions_cell <- SingleR(
+    test = sce,
+    # clusters
+    ref = sce_list_ref,
+    labels = list(
+      petro = sce_list_ref$Petropoulos2016_ref$annot_pub,
+      yana = sce_list_ref$Yanagida2021_ref$annot_pub,
+      xiang = sce_list_ref$Xiang2020_ref$annot_pub
+    ),
+    de.method = "wilcox", de.n = 30, BPPARAM = MulticoreParam(42)
+  )
+
+  # generate predictions
+  predictions_clust <- SingleR(
+    test = sce,
+    clusters = sce$SCT_snn_res.2,
+    ref = sce_list_ref,
+    labels = list(
+      petro = sce_list_ref$Petropoulos2016_ref$annot_pub,
+      yana = sce_list_ref$Yanagida2021_ref$annot_pub,
+      xiang = sce_list_ref$Xiang2020_ref$annot_pub
+    ),
+    de.method = "wilcox", de.n = 30, BPPARAM = MulticoreParam(42)
+  )
+
+  # DEGs infered by wilcoxon ranked sum test for each reference
+  seurat_object$annot_snglr_cell <- predictions_cell$labels
+  seurat_object$annot_snglr_clust <- predictions_clust$labels
+
+  return(seurat_object)
+})
+
+# annotate datasets from all references (cell) - use sctype_clust annot (harmonized)
+seurat.list <- lapply(seurat.list, function(seurat_object) {
+  sce <- SingleCellExperiment(assays = list(normcounts = GetAssayData(seurat_object, assay = "SCT", layer = "data")), colData = seurat_object@meta.data)
+  logcounts(sce) <- normcounts(sce) # counts already normalized, but slot used downstream
+
+  # use gene names as feature symbols
+  rowData(sce)$feature_symbol <- rownames(sce)
+
+  # generate predictions
+  predictions_cell <- SingleR(
+    test = sce,
+    # clusters
+    ref = sce_list_ref,
+    labels = list(
+      petro = sce_list_ref$Petropoulos2016_ref$annot_sctype_clust,
+      yana = sce_list_ref$Yanagida2021_ref$annot_sctype_clust,
+      xiang = sce_list_ref$Xiang2020_ref$annot_sctype_clust
+    ),
+    de.method = "wilcox", de.n = 30, BPPARAM = MulticoreParam(42)
+  )
+
+  # generate predictions
+  predictions_clust <- SingleR(
+    test = sce,
+    clusters = sce$SCT_snn_res.2,
+    ref = sce_list_ref,
+    labels = list(
+      petro = sce_list_ref$Petropoulos2016_ref$annot_sctype_clust,
+      yana = sce_list_ref$Yanagida2021_ref$annot_sctype_clust,
+      xiang = sce_list_ref$Xiang2020_ref$annot_sctype_clust
+    ),
+    de.method = "wilcox", de.n = 30, BPPARAM = MulticoreParam(42)
+  )
+
+  # DEGs infered by wilcoxon ranked sum test for each reference
+  seurat_object$annot_snglr_cell_mrk <- predictions_cell$labels
+  seurat_object$annot_snglr_clust_mrk <- predictions_clust$labels
+
+  return(seurat_object)
+})
+
+###########################################
+# com.markers <- getClassicMarkers(
+#     ref = sce_list_ref,
+#     labels=list(
+#                          petro=sce_list_ref$Petropoulos2016_ref$annot_pub,
+#                          yana=sce_list_ref$Yanagida2021_ref$annot_pub,
+#                          xiang=sce_list_ref$Xiang2020_ref$annot_pub), de.n = 30)
+#
+# # use shared marker genes
+# predictions_class <- SingleR(test=sce,
+#                        # clusters
+#                        ref=sce_list_ref,
+#                        labels=list(
+#                          petro=sce_list_ref$Petropoulos2016_ref$annot_pub,
+#                          yana=sce_list_ref$Yanagida2021_ref$annot_pub,
+#                          xiang=sce_list_ref$Xiang2020_ref$annot_pub),
+#                        genes = list(com.markers, com.markers, com.markers))
+#
+# predictions_wxn <- SingleR(test=sce,
+#                        # clusters
+#                        ref=sce_list_ref,
+#                        labels=list(
+#                          petro=sce_list_ref$Petropoulos2016_ref$annot_pub,
+#                          yana=sce_list_ref$Yanagida2021_ref$annot_pub,
+#                          xiang=sce_list_ref$Xiang2020_ref$annot_pub),
+#                        de.method="wilcox", de.n=30)
+#
+# ## diagnostics
+# head(sort(table(predictions_class$labels), decreasing=TRUE))
+# head(sort(table(predictions_wxn$labels), decreasing=TRUE))
+#
+# plotScoreHeatmap(predictions_class)
+# plotScoreHeatmap(predictions_wxn)
+#
+# plotScoreDistribution(predictions_class, references = 0)
+# plotScoreDistribution(predictions_wxn, references = 0)
+# #delta: the difference between the score and median of all labels for each cell.
+# # cells are pruned based on how their deltas compare to other cells with the same label.
+#
+# table(predictions_class$pruned.labels, predictions_wxn$pruned.labels)
+#
+# matched <- matchReferences(sce, sce,
+#     predictions_class$pruned.labels, predictions_wxn$pruned.labels)
+# pheatmap::pheatmap(matched, col=viridis::plasma(100))
+#
+# sce$annot_singler_wx = predictions_wxn$labels #DEGs infered by wilcoxon ranked sum test for each reference
+# sce$annot_singler_clsc = predictions_class$labels #DEGs ingered by classical LFC between all labels across references
+```
+an advantage of cell-level annotation is its persistence to downstream tasks, like removing cells and clustering. Since the method uses Spearman correlation, then raw UMI counts can be used, since logtransform is monotonic. However, if we contrast full-length sequencing results, then it is recommended to estimate TPM first to correct for gene length effect. It is recommeded to use a reference from the same platform, but SingleR should be robust either way. Additionally, a pseudo-bulk aggregation scheme is used to increase the effeciency of the algorithm, where cells under each label are clustered by kmeans into k=sqrt(N_label) clusters. The similarity scores are computed to these pseudo-bulk references using markers computed on the single-cell levels. 
+
+One thing to consider is the use of the union of the marker genes which assist in distinguishing the cells, where the markers are acquired with wilcoxon-test between labels for single-cell references. Optimally, we would acquire the list of markers with a DESeq-like approach to correct for factor sizes. For effeciency, we proceed with wilcoxon ranked sum test.
+
+One challenge faced when mapping to multiple references is the harmonization of the labels. Are the labels expected to be equivilant between datasets? or should we make dataset specific labels? In our case, we expect our reference datasets to describe the same datasets. However, the labels don't match when it comes to the spearman correlation of the different datasets. We therefor 
+To utilize having multiple reference datasets, we acquire markers that are consistently upregulated between the references, which increases the chance that they are generalizable markers for our clusters of interest. We do so through `scran`'s `getClassicMarkers`. 
+
+```{r}
+## diagnostics
+
+## Find markers for the assigned labels, do the DEGs form distinct clusters?
+# Taking the first 20 reference markers that are the top empirical markers.
+library(scran)
+empirical.markers <- findMarkers(sce, sce$annot_singler_wx, direction = "up")
+
+collected <- list()
+for (lab in unique(predictions_wxn$labels)) {
+  lab.markers <- unique(unlist(com.markers[[lab]]))
+  m <- match(lab.markers, rownames(empirical.markers[[lab]]))
+  m <- lab.markers[rank(m) <= 20]
+  collected[[lab]] <- plotHeatmap(sce,
+    silent = TRUE,
+    order_columns_by = "annot_singler_wx", main = lab, features = m
+  )[[4]]
+}
+do.call(gridExtra::grid.arrange, collected)
+
+## Is the ARI large (>0.5) for annotation compared to clustering label?
+library(bluster)
+pairwiseRand(sce$integrated_snn_res.0.8, predictions_wxn$labels, mode = "index")
+pairwiseRand(sce$integrated_snn_res.2, predictions_wxn$labels, mode = "index")
+```
+After assessing the results from scran union of markers from getClassicMarkers and wilcoxon ranked sum test, we find wilcoxon ranked sum test has more distinguishing markers than the former. We therefore proceed with wilcoxon generated results.
+
+## METHOD 3: SVM + RF
+```{r}
+## self-trained. will skip for now.
+```
+
+
+# save annotated data
+```{r}
+# saveRDS(seurat.list, "annotated_seurat_list.rds")
+seurat.list <- readRDS("annotated_seurat_list.rds")
+```
+
+
+## Assess Annotations
+We check the annotation distributions across the datasets.
+Before showing the results, we want the annotations which leaves least number of cells unassigned - since we expect to do a deeper investigation into each type to determine subtypes, and therefore prefer sensitivity over selectivity.
+
+```{r show annotations}
+## method name reference for more professional plot labels
+method_names <- data.frame(
+  old =
+    c(
+      "scina", "aucell", "sctype_clust", "sctype_cell", "pub",
+      "scmap_clust", "scmap_cell_p", "scmap_cell_y", "scmap_cell_x", "scmap_clust_p", "scmap_clust_y",
+      "scmap_clust_x", "scmap_cell",
+      "snglr_cell", "snglr_clust",
+      "snglr_cell_mrk", "snglr_clust_mrk",
+      "scmap_clust_p_mrk", "scmap_clust_y_mrk", "scmap_clust_x_mrk", "scmap_clust_mrk",
+      "scmap_cell_p_mrk", "scmap_cell_y_mrk", "scmap_cell_x_mrk", "scmap_cell_mrk"
+    ),
+  new = c(
+    "SCINA", "AUCell", "SCType_clust", "SCType_cell", "Published",
+    "scmap_clust", "scmap_cell_petro", "scmap_cell_yana", "scmap_cell_xiang",
+    "scmap_clust_petro", "scmap_clust_yana", "scmap_clust_xiang", "scmap_cell",
+    "SingleR_cell", "SingleR_clust",
+    "SingleR_cell_marker", "SingleR_clust_marker",
+    "scmap_clust_petro_mrk", "scmap_clust_yana_mrk", "scmap_clust_xiang_mrk", "scmap_clust_mrk",
+    "scmap_cell_petro_mrk", "scmap_cell_yana_mrk", "scmap_cell_xiang_mrk", "scmap_cell_mrk"
+  ),
+  type = c(
+    "m", "m", "m", "m", "pub", # annotatoin is m: marker-based, or r: reference-based
+    "r", "r", "r", "r", "r", "r",
+    "r", "r",
+    "r", "r",
+    "r", "r",
+    "r", "r", "r", "r",
+    "r", "r", "r", "r"
+  ),
+  labs = c(
+    "m", "m", "m", "m", "pub", # labels are based on m:marker list, p:publication labels
+    "p", "p", "p", "p", "p", "p",
+    "p", "p",
+    "p", "p",
+    "m", "m",
+    "m", "m", "m", "m",
+    "m", "m", "m", "m"
+  )
+)
+
+# get annotaion distribution for each method
+summ_annot.list <- lapply(seq_along(seurat.list), function(i) {
+  annot_vecs <- grep("annot_", colnames(seurat.list[[i]]@meta.data), value = TRUE)
+  annot_meta <- seurat.list[[i]]@meta.data[, annot_vecs]
+  summ_annot <- apply(annot_meta, 2, table)
+  if (is.matrix(summ_annot)) {
+    summ_annot <- t(summ_annot)
+    rownames(summ_annot) <- sub(pattern = "annot_", replacement = "", rownames(summ_annot))
+    summ_annot <- as.data.frame(summ_annot)
+    return(summ_annot)
+  } else {
+    summ_annot <- lapply(summ_annot, function(x) as.list(x))
+    summ_annot <- rbindlist(summ_annot, fill = TRUE)
+    summ_annot <- as.data.frame(summ_annot)
+    rownames(summ_annot) <- sub(pattern = "annot_", replacement = "", annot_vecs)
+    return(summ_annot)
+  }
+})
+
+names(summ_annot.list) <- sapply(seurat.list, function(x) unique(x$sample))
+
+# print(summ_annot.list)
+
+# compress the dataframe for all datasets into one dataframe
+tmp.list <- lapply(summ_annot.list, function(summ_annot) {
+  summ_annot["method"] <- rownames(summ_annot)
+  summ_annot <- reshape2::melt(summ_annot)
+  return(summ_annot)
+})
+
+summ_annot_df <- rbindlist(tmp.list, use.names = TRUE, idcol = TRUE)
+summ_annot_df <- summ_annot_df %>%
+  group_by(.id, method) %>%
+  mutate(prop = value / sum(value, na.rm = T))
+
+# prepare to plot
+require(viridis)
+summ_annot_df$Annotation <- summ_annot_df$variable
+summ_annot_df$type <- method_names$type[match(summ_annot_df$method, method_names$old)]
+summ_annot_df$label <- method_names$labs[match(summ_annot_df$method, method_names$old)]
+summ_annot_df$method <- method_names$new[match(summ_annot_df$method, method_names$old)]
+summ_annot_df$method <- factor(summ_annot_df$method)
+
+# ggplot(summ_annot_df, aes(x=variable, y=prop, fill=method))+
+#   geom_col(position = "dodge")+
+#   scale_fill_viridis(discrete = T, option = "H") +
+#   facet_wrap(~.id)+
+#   coord_flip()+
+#   theme(axis.text.x = element_text(size = 5))
+
+ggplot(summ_annot_df, aes(x = method, y = prop, fill = Annotation)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis(discrete = T, option = "H") +
+  facet_wrap(~.id) +
+  ylab("Cell Proprtions") +
+  xlab("Annotation Methods") +
+  coord_flip() +
+  theme(axis.text.x = element_text(size = 5))
+
+ggplot(summ_annot_df, aes(x = method, y = Annotation, fill = prop)) +
+  geom_tile() +
+  scale_fill_viridis(option = "plasma") +
+  facet_wrap(~.id) +
+  ylab("Cell Proprtions") +
+  xlab("Annotation Methods")
+# coord_flip()+
+# theme(axis.text.x = element_text(size = 5))
+
+summ_annot_df_sub <- summ_annot_df[summ_annot_df$label == "m", ]
+summ_annot_df_sub <- summ_annot_df_sub[(summ_annot_df_sub$Annotation %in% unique(summ_annot_df_sub$Annotation[!is.na(summ_annot_df_sub$value)])), ]
+summ_annot_df_sub$Annotation <- as.factor(as.character(summ_annot_df_sub$Annotation))
+levels(summ_annot_df_sub$Annotation) <- c("EPI_ICM", "PE", "TE", "unassigned", "unassigned")
+ggplot(summ_annot_df_sub, aes(x = method, y = Annotation, fill = prop)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis(option = "plasma") +
+  facet_wrap(~.id) +
+  ylab("Assigned Labels") +
+  xlab("Annotation Methods") +
+  coord_flip() +
+  theme(
+    axis.text.x = element_text(size = 8, angle = 45, vjust = 1, hjust = 1),
+    strip.text.x = element_text(size = 5)
+  )
+# ggsave("")
+```
+To facilitate a comparison, we used marker list based labels (i.e. EPI_ICM, PE, TE) to investigate the overlap between methods. scmap does not assign the majority of cells in many of the datasets.This could be due to differences in platform, depth of sequencing, or other factors of data quality. Another cause could be that blastoid models indeed do have more ambiguous cell types compared to blastocysts. An interesting observation is that SCType_cell seems to generate more results for short-length read datasets than for full-length read datasets. For a more productive analysis, we take the methods which are sensitive, and risk false positives to be sorted through later. Therefore, downstream analysis relies on SCType_clust, SingleR_clust (marker), and SingleR_cell (marker).
+
+#Plot UMAPs for annotations
+```{r}
+df_ds <- data.frame(
+  # sample=names(seurat.list),
+  sample = sapply(seurat.list, function(x) {
+    unique(x$sample)
+  }),
+  ncells = sapply(seurat.list, ncol),
+  nfeatures = sapply(seurat.list, function(x) {
+    sum(rowSums(x@assays$RNA) > 10)
+  }),
+  tech = sapply(seurat.list, function(x) {
+    unique(x$tech)
+  }),
+  ref = sapply(seurat.list, function(x) {
+    unique(x$ref)
+  })
+)
+
+plotting.ls <- lapply(seurat.list, function(x) {
+  tmp_plotting.data <- cbind(x@meta.data, Embeddings(x, "umap"))
+})
+tmp_plotting <- rbindlist(plotting.ls, use.names = TRUE, fill = TRUE, idcol = TRUE)
+
+tmp_plotting$sample <- factor(tmp_plotting$sample)
+tmp_plotting$sample <- fct_inorder(tmp_plotting$sample)
+
+annot_vec <- grep("^annot_", colnames(tmp_plotting), value = TRUE)
+
+hex3 <- hue_pal()(3)
+celltype_color <- c(hex3, "lightgrey")
+
+# for (i in seq_along(annot_vec)) {
+for (i in c(1,3,24,26)) {
+  tmp_plotting$celltype <- tmp_plotting[[annot_vec[i]]]
+
+  ggplot(tmp_plotting, aes(x = umap_1, y = umap_2, color = celltype)) +
+    geom_point(size = 0.5) +
+    theme_bw() +
+    # theme_pubclean() +
+    scale_color_manual(values = celltype_color)+
+    facet_wrap(~sample, nrow = 2) +
+    ggtitle(paste0("UMAP with ", gsub("annot_", "", annot_vec[i]), " annotations")) +
+    theme(strip.text = element_text(size = 9), legend.text = element_text(size = 10), legend.position = "right") +
+    guides(color = guide_legend(override.aes = list(size = 3)))
+
+  ggsave(paste0("03_annotation/figures/annot_umap/umap_all_", annot_vec[i], ".svg"), width = 9, height = 4)
+}
+```
+<!-- To verify the reliability of annotation schemes, we contrast the different methods using 3 metrics: -->
+<!-- 1. Adjusted Rand Index -->
+<!-- 2. Normalized Mutual Information -->
+<!-- 3. Cohen's Kappa -->
+To verify the reliability of annotation schemes, we contrast the different methods using the Adjusted Rand Index (ARI).
+
+```{r}
+# evaluate overlap of annotations
+
+
+# getJI = function(cl1,  cl2){
+#   # Assuming you have your data in the 'plotting.data' dataframe
+#   require(dplyr)
+#   require(proxy)
+#   # Calculate Jaccard Index
+#   jaccard_index <- 1 - proxy::simil(x = as.matrix(cl1), y = as.matrix(cl2), method = "Jaccard")
+#   # print(paste("Jaccard Index:", jaccard_index))
+#   return(jaccard_index)
+# }
+getARI <- function(cl1, cl2) {
+  # Assuming you have your data in the 'plotting.data' dataframe
+  require(pdfCluster)
+  # Calculate Adjusted Rand Index
+  ari <- adj.rand.index(as.factor(cl1), as.factor(cl2))
+  # print(paste("Adjusted Rand Index:", round(ari, digits = 2)))
+  return(ari)
+}
+# getNMI = function(cl1,  cl2){
+#   # Assuming you have your data in the 'plotting.data' dataframe
+#   require(infotheo)
+#   # Calculate the entropy
+#   ent_1 = max(entropy(as.factor(cl1)), 0)
+#   ent_2 = max(entropy(as.factor(cl2)), 0)
+#   entropy_value <- mutinformation(as.factor(cl1), as.factor(cl2))/(sqrt(ent_1) * entropy(ent_2))
+#   # print(paste("Mutual Information:", round(entropy_value2, 2)))
+#   return(entropy_value)
+# } #compute shared entropy between labels
+# getCK = function(cl1, cl2){
+#   require(psych)
+#   CK.obj = cohen.kappa(table(cl1, cl2))
+#   # print(paste("Cohen's kappa:", round(CK.value, 2)))
+#   return(CK.obj$weighted.kappa)
+# } #compute alignment between labels
+
+# Extract sample and cluster labels
+
+## generate a DF with method, celltype, annotation, and frequency for each reference dataset
+ari_mat.list <- lapply(seq_along(seurat.list), function(i) {
+  annot_vecs <- grep("annot_", colnames(seurat.list[[i]]@meta.data), value = TRUE)
+  annot_meta <- seurat.list[[i]]@meta.data[, annot_vecs]
+
+  ari_mat <- matrix(nrow = ncol(annot_meta), ncol = ncol(annot_meta))
+  # ck_mat = matrix(nrow = ncol(annot_meta), ncol = ncol(annot_meta))
+  # nmi_mat = matrix(nrow = ncol(annot_meta), ncol = ncol(annot_meta))
+  for (i in seq(ncol(annot_meta))) {
+    for (j in seq(i, ncol(annot_meta))) {
+      ari_mat[i, j] <- ari_mat[j, i] <- getARI(annot_meta[, i], annot_meta[, j])
+      # ck_mat[i,j] = ck_mat[j,i] = getCK(annot_meta[,i], annot_meta[,j])
+      # nmi_mat[i,j] = nmi_mat[j,i] = getNMI(annot_meta[,i], annot_meta[,j])
+    }
+  }
+
+  rownames(ari_mat) <- colnames(ari_mat) <- colnames(annot_meta)
+  return(ari_mat)
+})
+
+# assign reference name to list item
+names(ari_mat.list) <- sapply(seurat.list, function(x) unique(x$sample))
+
+# keep seperated since original data has different labels
+plts <- lapply(seq_along(ari_mat.list), function(i) {
+  ari_mat <- ari_mat.list[[i]]
+
+  # filter
+  # get mrk
+  annot_vecs <- sub("annot_", "", rownames(ari_mat))
+  method_idx <- match(annot_vecs, method_names$old)
+  keep_methods <- which(method_names$labs[method_idx] %in% c("m", "pub"))
+  ari_mat <- ari_mat[keep_methods, keep_methods]
+
+  annot_vecs <- sub("annot_", "", rownames(ari_mat))
+  rownames(ari_mat) <- colnames(ari_mat) <- method_names$new[match(annot_vecs, method_names$old)]
+
+  ari_mat_long <- reshape2::melt(ari_mat)
+
+  require(viridis)
+  ari_mat_long$ARI <- ari_mat_long$value
+  ari_mat_long$Method1 <- factor(ari_mat_long$Var1)
+  ari_mat_long$Method2 <- factor(ari_mat_long$Var2)
+  ari_mat_long$Annotation <- ari_mat_long$variable
+
+
+
+
+  plt <- ggplot(ari_mat_long, aes(x = Method1, y = Method2, fill = value)) +
+    geom_tile(color = "white") +
+    # scale_fill_distiller(palette = "YlOrBr")+
+    # scale_fill_gradient(low = "purple", high = "skyblue", space="Lab")+
+    scale_fill_viridis(option = "plasma") +
+    ylab("Annotation Methods") +
+    xlab("Annotation Methods") +
+    ggtitle(names(ari_mat.list)[i]) +
+    theme_minimal() + # minimal theme
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+    coord_fixed()
+
+  plt
+  return(plt)
+})
+
+plts
+
+plts <- lapply(seq_along(ari_mat.list), function(i) {
+  # ari_mat = ari_mat.list[[i]]
+  # SELECT_METHODS = c("annot_scina", "annot_sctype_clust", "annot_pub",
+  #                    "annot_scmap_clust", "annot_scmap_cell_p", "annot_scmap_cell_y", "annot_scmap_cell_x",
+  #                    "annot_scmap_clust_p", "annot_scmap_clust_y", "annot_scmap_clust_x", "annot_scmap_cell",
+  #                    "annot_snglr_cell", "annot_snglr_clust",
+  #                    "annot_snglr_cell_mrk", "annot_snglr_clust_mrk")
+  # keep_methods = rownames(ari_mat) %in% SELECT_METHODS
+  # ari_mat = ari_mat[keep_methods, keep_methods]
+  # rownames(ari_mat) = colnames(ari_mat) = sub("annot_","",rownames(ari_mat))
+  # rownames(ari_mat) = method_names$new[match(rownames(ari_mat),method_names$old)]
+  # colnames(ari_mat) = method_names$new[match(colnames(ari_mat),method_names$old)]
+
+  ari_mat <- ari_mat.list[[i]]
+
+  # filter
+  # get mrk
+  annot_vecs <- sub("annot_", "", rownames(ari_mat))
+  method_idx <- match(annot_vecs, method_names$old)
+  keep_methods <- which(method_names$labs[method_idx] %in% c("m", "pub"))
+  ari_mat <- ari_mat[keep_methods, keep_methods]
+
+  annot_vecs <- sub("annot_", "", rownames(ari_mat))
+  rownames(ari_mat) <- colnames(ari_mat) <- method_names$new[match(annot_vecs, method_names$old)]
+
+  plt <- pheatmap::pheatmap(ari_mat, col = viridis::plasma(100), main = names(ari_mat.list)[i])
+  return(plt[[4]])
+})
+
+require(gridExtra)
+require(grid)
+require(lattice)
+
+grid.arrange(grobs = plts[seq(3)], ncol = 2)
+grid.arrange(grobs = plts[seq(4, 7)], ncol = 2)
+grid.arrange(grobs = plts[seq(8, 10)], ncol = 2)
+```
+While more analysis is required, we proceed with marker based annotation to avoid the issue of label harmonization. We avoid the use of integration-based annotation to reduce confoundability in downstream comparative analysis. To finalize assignment of labels, we take a majority score.
+
+#############
+# majority vote out of 3 - exclude for ties
+#############
+
+## Method assignment distribution
+We first check the distribution of assignments for the selected methods.
+```{r}
+summ_annot.list <- lapply(seq_along(seurat.list), function(i) {
+  annot_vecs <- grep("annot_", colnames(seurat.list[[i]]@meta.data), value = TRUE)
+  annot_meta <- seurat.list[[i]]@meta.data[, annot_vecs]
+
+  annot_meta <- annot_meta[, colnames(annot_meta) %in% c(
+    "annot_scina",
+    "annot_sctype_clust",
+    # "annot_sctype_cell",
+    "annot_snglr_cell_mrk"
+  )]
+  # "annot_snglr_clust_mrk")] #select SCType_clust, SCType_cell, SingleR_clust (marker), and SingleR_cell (marker)
+
+  summ_annot <- apply(annot_meta, 2, table)
+  if (is.matrix(summ_annot)) {
+    summ_annot <- t(summ_annot)
+    rownames(summ_annot) <- sub(pattern = "annot_", replacement = "", rownames(summ_annot))
+    summ_annot <- as.data.frame(summ_annot)
+    return(summ_annot)
+  } else {
+    summ_annot <- lapply(summ_annot, function(x) as.list(x))
+    summ_annot <- rbindlist(summ_annot, fill = TRUE, use.names = TRUE, idcol = TRUE)
+    summ_annot <- as.data.frame(summ_annot)
+    rownames(summ_annot) <- summ_annot$.id
+    summ_annot <- summ_annot[, -1]
+    rownames(summ_annot) <- sub(pattern = "annot_", replacement = "", rownames(summ_annot))
+    return(summ_annot)
+  }
+})
+
+names(summ_annot.list) <- sapply(seurat.list, function(x) unique(x$sample))
+
+# print(summ_annot.list)
+
+tmp.list <- lapply(summ_annot.list, function(summ_annot) {
+  summ_annot["method"] <- rownames(summ_annot)
+  summ_annot <- reshape2::melt(summ_annot)
+  return(summ_annot)
+})
+
+summ_annot_df <- rbindlist(tmp.list, use.names = TRUE, idcol = TRUE)
+summ_annot_df <- summ_annot_df %>%
+  group_by(.id, method) %>%
+  mutate(prop = value / sum(value, na.rm = T))
+
+require(viridis)
+summ_annot_df$Annotation <- factor(summ_annot_df$variable)
+summ_annot_df$method <- factor(summ_annot_df$method)
+levels(summ_annot_df$method) <- method_names$new[match(levels(summ_annot_df$method), method_names$old)]
+# ggplot(summ_annot_df, aes(x=variable, y=prop, fill=method))+
+#   geom_col(position = "dodge")+
+#   scale_fill_viridis(discrete = T, option = "H") +
+#   facet_wrap(~.id)+
+#   coord_flip()+
+#   theme(axis.text.x = element_text(size = 5))
+
+ggplot(summ_annot_df, aes(x = method, y = prop, fill = Annotation)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis(discrete = T, option = "H") +
+  facet_wrap(~.id) +
+  theme_pubclean() +
+  ylab("Cell Proprtions") +
+  xlab("Annotation Methods") +
+  coord_flip() +
+  theme(axis.text.x = element_text(size = 8), strip.text.x = element_text(size = 8), legend.position = "right")
+
+ggsave("03_annotation/figures/marker_based_annot_cellproportions_barplot.png", width = 9, height = 5)
+```
+
+
+
+```{r}
+# ari_mat.list = lapply(seq_along(seurat.list), function(i){
+annot_meta_score.list <- lapply(seq_along(seurat.list), function(i) {
+  annot_vecs <- grep("annot_", colnames(seurat.list[[i]]@meta.data), value = TRUE)
+  annot_meta <- seurat.list[[i]]@meta.data[, annot_vecs]
+
+  annot_meta <- annot_meta[, colnames(annot_meta) %in% c(
+    "annot_sctype_clust",
+    # "annot_sctype_cell",
+    "annot_snglr_cell_mrk",
+    "annot_snglr_clust_mrk"
+  )] # select SCType_clust, SCType_cell, SingleR_clust (marker), and SingleR_cell (marker)
+  annot_meta_score <- apply(annot_meta, 1, table)
+  annot_meta_score <- lapply(annot_meta_score, function(x) as.list(x))
+  annot_meta_score_df <- rbindlist(annot_meta_score, use.names = TRUE, idcol = TRUE, fill = TRUE)
+  annot_meta_score_df <- as.data.frame(annot_meta_score_df)
+  rownames(annot_meta_score_df) <- annot_meta_score_df$.id
+  annot_meta_score_df <- annot_meta_score_df[, -1]
+  annot_meta_score_df[is.na(annot_meta_score_df)] <- 0
+  # annot_meta_score_df = sweep(annot_meta_score_df, 1, FUN ="/", STATS = 4)
+
+  return(annot_meta_score_df)
+})
+
+names(annot_meta_score.list) <- names(seurat.list)
+
+better_col_palette <- RColorBrewer::brewer.pal(3, name = "PuRd")
+better_col_palette = c("white",better_col_palette)
+# plot heatmap
+plts <- lapply(seq_along(annot_meta_score.list), function(i) {
+  plt <- pheatmap::pheatmap(annot_meta_score.list[[i]],
+    # breaks = c(-.1,-.05, 0.5, 1.5, 2.5, 3.5),
+    breaks = c(0, 0.5, 1.5, 2.5, 3.5),
+    # col = viridis::viridis(4),
+    col = better_col_palette,
+    show_rownames = FALSE,
+    cluster_cols = FALSE,
+    # legend = F,
+    main = names(annot_meta_score.list)[i], border_color = NA
+  )
+  return(plt[[4]])
+})
+
+
+g1 = arrangeGrob(grobs = plts, nrow = 1)
+ggsave("03_annotation/figures/majority_vote_heatmap.png", plot = g1, width = 20, height = 8)
+
+# assign majority label
+seurat.list <- lapply(seq_along(annot_meta_score.list), function(i) {
+  annot_meta_score_df <- annot_meta_score.list[[i]]
+  annot_meta_score_df[annot_meta_score_df < 0.5 * max(annot_meta_score_df)] <- 0 # drop anything less than half (minority and ties)
+  annot_maj_assignment <- max.col(annot_meta_score_df) # get index for maximum vote
+  annot_maj_assignment <- colnames(annot_meta_score.list[[i]])[annot_maj_assignment] # assign as labels
+  annot_maj_assignment[rowSums(annot_meta_score_df) == 0] <- "unknown" # assign ties as unknown
+  seurat.list[[i]]$annot_major <- annot_maj_assignment # transfer to seurat object
+  return(seurat.list[[i]])
+})
+
+names(seurat.list) <- sapply(seurat.list, function(x) unique(x$sample))
+```
+
+# save final annotated data
+```{r}
+# saveRDS(seurat.list, "annotated_seurat_list.rds")
+seurat.list <- readRDS("03_annotation/results/annotated_seurat_list.rds")
+```
+
+# Check Dataset Distributions
+```{r}
+hex3 <- hue_pal()(3)
+celltype_color <- c(hex3, "lightgrey")
+
+df_ds <- data.frame(
+  # sample=names(seurat.list),
+  sample = sapply(seurat.list, function(x) {
+    unique(x$sample)
+  }),
+  ncells = sapply(seurat.list, ncol),
+  nfeatures = sapply(seurat.list, function(x) {
+    sum(rowSums(x@assays$RNA) > 10)
+  }),
+  tech = sapply(seurat.list, function(x) {
+    unique(x$tech)
+  }),
+  ref = sapply(seurat.list, function(x) {
+    unique(x$ref)
+  })
+)
+
+plotting.ls <- lapply(seurat.list, function(x) {
+  tmp_plotting.data <- cbind(x@meta.data, Embeddings(x, "umap"))
+})
+tmp_plotting <- rbindlist(plotting.ls, use.names = TRUE, fill = TRUE, idcol = TRUE)
+tmp_plotting$celltype <- tmp_plotting$annot_major
+sampled_data <- tmp_plotting %>%
+  group_by(sample) %>%
+  sample_n(size = 5000, replace = TRUE) %>%
+  ungroup() %>%
+  distinct() # Remove duplicates
+
+ggplot(sampled_data, aes(x = umap_1, y = umap_2, color = celltype)) +
+  geom_point(size = 0.5) +
+  scale_color_manual(values = celltype_color)+
+  theme_bw() +
+  facet_wrap(~sample, nrow = 2)
+```
+The above figure shows the UMAP of the different datasets with their consensus annotation labels. It shows relatively distinct clustering of cell-type labels. It also recovers expected trends, such as the abundance of PE in Sozen2021, which has been reported in the original work. 
+
+
+
+# Plot Celltype Distribution
+```{r}
+require(patchwork)
+
+plotting.ls <- lapply(seurat.list, function(x) {
+  tmp_plotting.data <- cbind(x@meta.data, Embeddings(x, "umap"))
+})
+tmp_plotting <- rbindlist(plotting.ls, use.names = TRUE, fill = TRUE, idcol = TRUE)
+tmp_plotting$celltype <- tmp_plotting$annot_major
+
+tmp.df <- tmp_plotting %>%
+  group_by(sample, celltype) %>%
+  summarise(count = n(), .groups = "drop")
+tmp.mat <- reshape2::acast(data = tmp.df, formula = sample ~ celltype)
+tmp.mat <- apply(tmp.mat, 2, "/", rowSums(tmp.mat)) # normalize for proportions rather than counts
+hclust_obj <- hclust(dist(tmp.mat))
+
+p4 <- ggdendrogram(hclust_obj, rotate = TRUE, size = 3) +
+  # scale_y_reverse() +
+  # scale_x_reverse() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.text.x = element_blank()
+  )
+
+tmp_plotting$sample <- factor(tmp_plotting$sample, levels = hclust_obj$labels[hclust_obj$order])
+p1 <- ggplot(tmp_plotting, aes(x = sample, fill = celltype)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_fill_manual(values = celltype_color)+
+  theme(legend.position = "bottom")
+wrap_plots(p1, p4, guides = "collect") & theme(legend.position = "bottom")
+ggsave("03_annotation/figures/celltype_proportions_across_datasets_clustered.png", height = 4, width = 5)
+```
+In the above figure, we see the relative abundances of the assigned cell-type labels. The clustering shows associations between Yu2021 (both PXGL and 5iLA) and Kagawa2022, seemingly driven by increased abundances in EPI_ICM-like cells. Liu2021 seems to correspond with respect to the reduced TE-like abunance relative to other models in cluster 2. Yanagida2021 clusters well with the reference datasets. Fan2021 also falls in cluster 2, but is distinct in its lower abundance of EPI_ICM-like and PE-like cells. Most distinct is the PE-like cell rich Sozen2021.
+
+We do the same without the unknown cells.
+```{r}
+require(patchwork)
+
+plotting.ls <- lapply(seurat.list, function(x) {
+  tmp_plotting.data <- cbind(x@meta.data, Embeddings(x, "umap"))
+})
+tmp_plotting <- rbindlist(plotting.ls, use.names = TRUE, fill = TRUE, idcol = TRUE)
+tmp_plotting$celltype <- tmp_plotting$annot_major
+tmp_plotting <- tmp_plotting[tmp_plotting$celltype != "unknown", ]
+
+tmp.df <- tmp_plotting %>%
+  group_by(sample, celltype) %>%
+  summarise(count = n(), .groups = "drop")
+tmp.mat <- reshape2::acast(data = tmp.df, formula = sample ~ celltype)
+tmp.mat <- apply(tmp.mat, 2, "/", rowSums(tmp.mat)) # normalize for proportions rather than counts
+hclust_obj <- hclust(dist(tmp.mat))
+
+p4 <- ggdendrogram(hclust_obj, rotate = TRUE, size = 3) +
+  # scale_y_reverse() +
+  # scale_x_reverse() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.text.x = element_blank()
+  )
+
+tmp_plotting$sample <- factor(tmp_plotting$sample, levels = hclust_obj$labels[hclust_obj$order])
+p1 <- ggplot(tmp_plotting, aes(x = sample, fill = celltype)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  theme(legend.position = "bottom")
+wrap_plots(p1, p4, guides = "collect") & theme(legend.position = "bottom")
+ggsave("03_annotation/figures/celltype_proportions_across_datasets_clustered_nounk.png", height = 4, width = 5)
+```
+
+## Methods:
+
+To annotate the cells, we review multiple marker-based and reference-based annotation methods (SCINA, AUCell, SCType, scmap, SingleR). As inputs, we use the SCTransform residuals. We first implement the marker-based methods using our curated list of genes. 
+
+The first method, SCINA, is a semi-supervised methods which requires list of signature genes (one or more signature per celltype). It assumes a bimodal expression of the signature genes in the normalized expression matrix. We use the default settings along with our curated gene list shown in Table 1.
+
+The second method, AUCell, uses a ranking approach to determine prevalence of markers in each cell. It scores the label assignment by computing the AUC under the recovery curve of the marker gene rank compared to the genes' occurrence given a random sample (see their supplementary for more). It is independent of unit and normalization procedure, but requires large gene lists for reliable annotation. For thoroughness, we test the annotation with AUCell, even though our gene lists are small. After assessing the diagnostic panel, we determine AUCell to not perform well - and therefore exclude it from downstream analysis steps. This is not surprising since the gene set was small, which is discouraged for this particular method.
+
+The third method we use is SCType. The main contribution of this particular method lies in assembly of a database from other references, and filtering for reliability. While their database does not include our system of interest, the human peri-implantation blastocyst, we utilize their annotation algorithm. The algorithm uses a normalized sum of the positive and negative expression of z-scored genes while explicitly taking overlapping markers into consideration by penalizing with a specificity score. The method assigns labels at the single cell level, then generalizes to all cells in a predefined cluster based on a majority vote. For our purposes, we explore both the cell-level and the cluster-level label assignments named as `SCType_cell` and `SCType_clust` respectively. For the predefined clusters, we use seurat's clustering as introduced in preprocessing section of the methods.
+
+For the reference based methods, we 
+
+## Results:
+To annotate the cells, we review multiple marker-based (i.e. SCINA, AUCell, SCType) and reference-based annotation methods (i.e. scmap, SingleR). We first annotate with the marker-based methods (See Methods for more) using our curated markers from Table 1. We observe reasonable mapping between the annotations inferred by SCINA and SCType with published annotations of the reference datasets (see Figure #). AUCell shows many 'unknown' assignments due to its requirement of large gene lists (>30). SCINA assigns more 'unkown' labels than SCType, showing its high specificity. For our analysis, we perfer sensitivity over specificity due to the relatively lower SNR we expect in blastoid model data. Moreover, our reference datasets were generated from long-read methods, and therefore should already have an advantage in expressing characteristic signals at the gene expression level. 
+
+Our second selection of annotation methods are reference based annotators. We use the labels generated by SCType_clust implement reference based labeling on the blastoid datasets using scmap and SingleR using the labels assigned from marker-based annotation methods. This allows us to perserve label heterogeniety between the different references. We assess the results, 
+We then implement 
+
+```{r}
+# parallel setup
+sessionInfo()
+```
+
+```{r}
+# parallel setup
+stopCluster(clust)
+```

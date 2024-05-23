@@ -1,0 +1,339 @@
+---
+title: "preprocessing_supplementary_II"
+author: "Ali Balubaid"
+date: "2024-03-03"
+output: html_document
+---
+
+# ```{r setup, include=FALSE}
+# knitr::opts_chunk$set(echo = TRUE)
+# ```
+
+
+```{r}
+setwd('/home/balubao/Documents/Research/blastoid_comparison/')
+source('script/Initiation.R')
+
+## load libraries and functions for SCType
+source("script/sctype_annotation_functions.R")
+
+plan("multicore", workers = 36)
+
+ENSG2Sym = function(seurat.obj){
+  #turn ENSG rownames to symbols
+  ENST2ENSG = seurat.obj[["RNA"]][[]] #retrieve feature metadata
+  
+  new_gene_name = ENST2ENSG$hgnc_symbol[match(ENST2ENSG$gene_names, ENST2ENSG$ensembl_gene_id)]
+  empty_names = nchar(new_gene_name)==0 | is.na(new_gene_name)
+  new_gene_name[empty_names] = ENST2ENSG$gene_names[empty_names]
+  
+  rownames(seurat.obj[["RNA"]]) = make.unique(new_gene_name)
+  
+  return(seurat.obj)
+}
+
+# get scores
+# geneSet = GetSCTypeMarkers(tissueType = "Embryo_Sam2_set1")
+# gs_list = PrepSCTypeTables()
+# 
+# AnnotateByMarkers = function(seurat.obj){
+#   
+#   # annotate by scina
+#   require(SCINA)
+#   # annotate references
+#   # signatures = preprocess.signatures(file_path = ) #turn gene list to SCINA workable list
+#   expr = GetAssayData(seurat_object, layer="scale.data")
+#   results_scina = SCINA(expr, geneSet, rm_overlap = FALSE) #process, do not remove overlapping markers
+#   seurat_object$annot_scina = results_scina$cell_labels
+#   
+#   # annotate by sctype
+#   seurat_object = GetSCTypeAnnot(seurat_object, assay = "RNA")
+#   
+# }
+# AnnotateByReference
+```
+
+```{r load data}
+Petropoulos2016_ref = readRDS("../Data/Petropoulos2016/Petropoulos2016_filtered.rds")
+Xiang2020_ref = readRDS("../Data/Xiang2020/Xiang2020_filtered.rds")
+Yanagida2021_ref = readRDS("../Data/Yanagida2021/Yanagida2021_ref_filtered.rds")
+Yanagida2021 = readRDS("../Data/Yanagida2021/Yanagida2021_filtered.rds")
+Kagawa2022 = readRDS("../Data/Kagawa2022/Kagawa2022_filtered.rds")
+
+Sozen2021 = readRDS("../Data/Sozen2021/Sozen2021_filtered.rds")
+Fan2021 = readRDS("../Data/Fan2021/Fan2021_filtered.rds")
+Lui2021 = readRDS("../Data/Liu2021/Liu2021_filtered.rds")
+yu.list = readRDS("../Data/Yu2021/Yu2021_filtered_list.rds")
+```
+
+```{r Petropoulos2016_ref}
+## change ensembl_gene_ids to symbol
+Petropoulos2016_ref = ENSG2Sym(Petropoulos2016_ref)
+
+## add ERCC and remove
+Petropoulos2016_ref$ERCC.perc = PercentageFeatureSet(Petropoulos2016_ref, pattern = "^ERCC-")
+Petropoulos2016_ref = Petropoulos2016_ref[-grep("^ERCC-", rownames(Petropoulos2016_ref)),]
+
+## normalize 
+Petropoulos2016_ref = NormalizeData(Petropoulos2016_ref) %>% FindVariableFeatures(nfeatures = 3000)
+
+# scale (regress out CC.Score, ERCC.perc)
+Petropoulos2016_ref = CellCycleScoring(Petropoulos2016_ref, 
+                                       s.features = cc.genes.updated.2019$s.genes,
+                                       g2m.features = cc.genes.updated.2019$g2m.genes)
+Petropoulos2016_ref$CC.Score = Petropoulos2016_ref$G2M.Score - Petropoulos2016_ref$S.Score
+Petropoulos2016_ref = ScaleData(Petropoulos2016_ref, vars.to.regress = c("ERCC.perc","S.Score", "G2M.Score", "nFeature_RNA", "nCount_RNA"))
+
+list(c("ERCC.perc", "CC.Score", "nFeature_RNA"),)
+# dimension reduction
+Petropoulos2016_ref = RunPCA(Petropoulos2016_ref)
+ElbowPlot(Petropoulos2016_ref)
+
+# cluster
+Petropoulos2016_ref = FindNeighbors(Petropoulos2016_ref, reduction = "pca", dims = 1:10) %>% FindClusters(resolution = 2)
+
+# visualize and sanity check
+Petropoulos2016_ref = RunUMAP(Petropoulos2016_ref, reduction = "pca", dims = 1:10)
+DimPlot(Petropoulos2016_ref, group.by = c("Day", "Phase", "celltype_pub"))
+
+# save normalized, clustered datasets
+require(SeuratDisk)
+SaveH5Seurat(Petropoulos2016_ref, "../Data/Petropoulos2016/Petropoulos2016_ref_filtered_pp", overwrite = TRUE)
+```
+
+```{r Xiang2020_ref}
+## change ensembl_gene_ids to symbol
+Xiang2020_ref = ENSG2Sym(Xiang2020_ref)
+
+## normalize 
+Xiang2020_ref = NormalizeData(Xiang2020_ref) %>% FindVariableFeatures(nfeatures = 3000)
+
+# scale (regress out CC.Score, ERCC.perc)
+Xiang2020_ref = CellCycleScoring(Xiang2020_ref, 
+                                       s.features = cc.genes.updated.2019$s.genes,
+                                       g2m.features = cc.genes.updated.2019$g2m.genes)
+Xiang2020_ref$CC.Score = Xiang2020_ref$G2M.Score - Xiang2020_ref$S.Score
+Xiang2020_ref = ScaleData(Xiang2020_ref, vars.to.regress = c("S.Score", "G2M.Score", "nFeature_RNA", "nCount_RNA"))
+
+# dimension reduction
+Xiang2020_ref = RunPCA(Xiang2020_ref)
+ElbowPlot(Xiang2020_ref)
+
+# cluster
+Xiang2020_ref = FindNeighbors(Xiang2020_ref, reduction = "pca", dims = 1:15) %>% FindClusters(resolution = 2)
+
+# visualize and sanity check
+Xiang2020_ref = RunUMAP(Xiang2020_ref, reduction = "pca", dims = 1:15)
+DimPlot(Xiang2020_ref, group.by = c("Day", "Phase"))
+
+# save normalized, clustered datasets
+require(SeuratDisk)
+SaveH5Seurat(Xiang2020_ref, "../Data/Xiang2020/Xiang2020_ref_filtered_pp", overwrite = TRUE)
+```
+
+```{r Yanagida2021_ref}
+## change ensembl_gene_ids to symbol
+Yanagida2021_ref = ENSG2Sym(Yanagida2021_ref)
+
+## normalize 
+Yanagida2021_ref = NormalizeData(Yanagida2021_ref) %>% FindVariableFeatures(nfeatures = 3000)
+
+# scale (regress out CC.Score, ERCC.perc)
+Yanagida2021_ref = CellCycleScoring(Yanagida2021_ref, 
+                                       s.features = cc.genes.updated.2019$s.genes,
+                                       g2m.features = cc.genes.updated.2019$g2m.genes)
+Yanagida2021_ref$CC.Score = Yanagida2021_ref$G2M.Score - Yanagida2021_ref$S.Score
+Yanagida2021_ref = ScaleData(Yanagida2021_ref, vars.to.regress = c("S.Score", "G2M.Score", "nFeature_RNA", "nCount_RNA"))
+
+# dimension reduction
+Yanagida2021_ref = RunPCA(Yanagida2021_ref)
+ElbowPlot(Yanagida2021_ref)
+
+# cluster
+Yanagida2021_ref = FindNeighbors(Yanagida2021_ref, reduction = "pca", dims = 1:15) %>% FindClusters(resolution = 2)
+
+# visualize and sanity check
+Yanagida2021_ref = RunUMAP(Yanagida2021_ref, reduction = "pca", dims = 1:15)
+DimPlot(Yanagida2021_ref, group.by = c("Day", "Phase"))
+
+# save normalized, clustered datasets
+require(SeuratDisk)
+SaveH5Seurat(Yanagida2021_ref, "../Data/Yanagida2021/Yanagida2021_ref_filtered_pp", overwrite = TRUE)
+```
+
+```{r Yanagida2021}
+## change ensembl_gene_ids to symbol
+Yanagida2021 = ENSG2Sym(Yanagida2021)
+
+## normalize 
+Yanagida2021 = NormalizeData(Yanagida2021) %>% FindVariableFeatures(nfeatures = 3000)
+
+# scale (regress out CC.Score, ERCC.perc)
+Yanagida2021 = CellCycleScoring(Yanagida2021, 
+                                       s.features = cc.genes.updated.2019$s.genes,
+                                       g2m.features = cc.genes.updated.2019$g2m.genes)
+Yanagida2021$CC.Score = Yanagida2021$G2M.Score - Yanagida2021$S.Score
+Yanagida2021 = ScaleData(Yanagida2021, vars.to.regress = c("S.Score", "G2M.Score", "nFeature_RNA", "nCount_RNA"))
+
+# dimension reduction
+Yanagida2021 = RunPCA(Yanagida2021)
+ElbowPlot(Yanagida2021)
+
+# cluster
+Yanagida2021 = FindNeighbors(Yanagida2021, reduction = "pca", dims = 1:10) %>% FindClusters(resolution = 2)
+
+# visualize and sanity check
+Yanagida2021 = RunUMAP(Yanagida2021, reduction = "pca", dims = 1:10)
+DimPlot(Yanagida2021, group.by = c("Day", "Phase"))
+
+# save normalized, clustered datasets
+require(SeuratDisk)
+SaveH5Seurat(Yanagida2021, "../Data/Yanagida2021/Yanagida2021_filtered_pp", overwrite = TRUE)
+```
+
+```{r Kagawa2022}
+## change ensembl_gene_ids to symbol
+Kagawa2022 = ENSG2Sym(Kagawa2022)
+
+## normalize 
+Kagawa2022 = NormalizeData(Kagawa2022) %>% FindVariableFeatures(nfeatures = 3000)
+
+# scale (regress out CC.Score, ERCC.perc)
+Kagawa2022 = CellCycleScoring(Kagawa2022, 
+                                       s.features = cc.genes.updated.2019$s.genes,
+                                       g2m.features = cc.genes.updated.2019$g2m.genes)
+Kagawa2022$CC.Score = Kagawa2022$G2M.Score - Kagawa2022$S.Score
+Kagawa2022 = ScaleData(Kagawa2022, vars.to.regress = c("S.Score", "G2M.Score", "nFeature_RNA", "nCount_RNA"))
+
+# dimension reduction
+Kagawa2022 = RunPCA(Kagawa2022)
+ElbowPlot(Kagawa2022)
+
+# cluster
+Kagawa2022 = FindNeighbors(Kagawa2022, reduction = "pca", dims = 1:10) %>% FindClusters(resolution = 2)
+
+# visualize and sanity check
+Kagawa2022 = RunUMAP(Kagawa2022, reduction = "pca", dims = 1:10)
+DimPlot(Kagawa2022, group.by = c("Day", "Phase"))
+
+# save normalized, clustered datasets
+require(SeuratDisk)
+SaveH5Seurat(Kagawa2022, "../Data/Kagawa2022/Kagawa2022_filtered_pp", overwrite = TRUE)
+```
+
+```{r Sozen2021}
+## normalize 
+Sozen2021 = NormalizeData(Sozen2021) %>% FindVariableFeatures(nfeatures = 3000)
+
+# scale (regress out CC.Score, ERCC.perc)
+Sozen2021 = CellCycleScoring(Sozen2021, 
+                                       s.features = cc.genes.updated.2019$s.genes,
+                                       g2m.features = cc.genes.updated.2019$g2m.genes)
+Sozen2021$CC.Score = Sozen2021$G2M.Score - Sozen2021$S.Score
+Sozen2021 = ScaleData(Sozen2021, vars.to.regress = c("S.Score", "G2M.Score", "nFeature_RNA", "nCount_RNA"))
+
+# dimension reduction
+Sozen2021 = RunPCA(Sozen2021)
+ElbowPlot(Sozen2021)
+
+# cluster
+Sozen2021 = FindNeighbors(Sozen2021, reduction = "pca", dims = 1:10) %>% FindClusters(resolution = 2)
+
+# visualize and sanity check
+Sozen2021 = RunUMAP(Sozen2021, reduction = "pca", dims = 1:10)
+DimPlot(Sozen2021, group.by = c("Day", "Phase"))
+
+# save normalized, clustered datasets
+require(SeuratDisk)
+SaveH5Seurat(Sozen2021, "../Data/Sozen2021/Sozen2021_filtered_pp", overwrite = TRUE)
+```
+
+```{r Fan2021}
+
+## normalize 
+Fan2021 = NormalizeData(Fan2021) %>% FindVariableFeatures(nfeatures = 3000)
+
+# scale (regress out CC.Score, ERCC.perc)
+Fan2021 = CellCycleScoring(Fan2021, 
+                                       s.features = cc.genes.updated.2019$s.genes,
+                                       g2m.features = cc.genes.updated.2019$g2m.genes)
+Fan2021$CC.Score = Fan2021$G2M.Score - Fan2021$S.Score
+Fan2021 = ScaleData(Fan2021, vars.to.regress = c("S.Score", "G2M.Score", "nFeature_RNA", "nCount_RNA"))
+
+# dimension reduction
+Fan2021 = RunPCA(Fan2021)
+ElbowPlot(Fan2021)
+
+# cluster
+Fan2021 = FindNeighbors(Fan2021, reduction = "pca", dims = 1:15) %>% FindClusters(resolution = 2)
+
+# visualize and sanity check
+Fan2021 = RunUMAP(Fan2021, reduction = "pca", dims = 1:15)
+DimPlot(Fan2021, group.by = c("Day", "Phase"))
+
+# save normalized, clustered datasets
+# require(SeuratDisk)
+# SaveH5Seurat(Fan2021, "../Data/Fan2021/Fan2021_filtered_pp", overwrite = TRUE)
+saveRDS(Fan2021, "../Data/Fan2021/Fan2021_filtered_pp.rds")
+```
+
+```{r Lui2021}
+
+## normalize 
+Lui2021 = NormalizeData(Lui2021) %>% FindVariableFeatures(nfeatures = 3000)
+
+# scale (regress out CC.Score, ERCC.perc)
+Lui2021 = CellCycleScoring(Lui2021, 
+                                       s.features = cc.genes.updated.2019$s.genes,
+                                       g2m.features = cc.genes.updated.2019$g2m.genes)
+Lui2021$CC.Score = Lui2021$G2M.Score - Lui2021$S.Score
+Lui2021 = ScaleData(Lui2021, vars.to.regress = c("S.Score", "G2M.Score", "nFeature_RNA", "nCount_RNA"))
+
+# dimension reduction
+Lui2021 = RunPCA(Lui2021)
+ElbowPlot(Lui2021)
+
+# cluster
+Lui2021 = FindNeighbors(Lui2021, reduction = "pca", dims = 1:10) %>% FindClusters(resolution = 2)
+
+# visualize and sanity check
+Lui2021 = RunUMAP(Lui2021, reduction = "pca", dims = 1:10)
+DimPlot(Lui2021, group.by = c("Day", "Phase"))
+
+# save normalized, clustered datasets
+require(SeuratDisk)
+# SaveH5Seurat(Lui2021, "../Data/Liu2021/Lui2021_filtered_pp", overwrite = TRUE)
+saveRDS(Lui2021, "../Data/Liu2021/Lui2021_filtered_pp.rds")
+
+```
+
+```{r Yu2021}
+
+## normalize 
+yu.list = lapply(yu.list, function(x) NormalizeData(x) %>% FindVariableFeatures(nfeatures = 3000))
+
+# scale (regress out CC.Score, ERCC.perc)
+yu.list = lapply(yu.list, function(x){ 
+  x = CellCycleScoring(x, 
+                   s.features = cc.genes.updated.2019$s.genes,
+                   g2m.features = cc.genes.updated.2019$g2m.genes)
+  x$CC.Score = x$G2M.Score - x$S.Score
+  x = ScaleData(x, vars.to.regress = c("S.Score", "G2M.Score", "nFeature_RNA", "nCount_RNA"))
+  return(x)})
+
+# dimension reduction
+yu.list = lapply(yu.list, function(x) RunPCA(x))
+ElbowPlot(yu.list[[1]])
+ElbowPlot(yu.list[[2]])
+
+# cluster
+yu.list = lapply(yu.list, function(x) FindNeighbors(x, reduction = "pca", dims = 1:10) %>% FindClusters(resolution = 2))
+
+# visualize and sanity check
+yu.list = lapply(yu.list, function(x) RunUMAP(x, reduction = "pca", dims = 1:10))
+DimPlot(yu.list$Yu2021_LW60, group.by = c("Day", "Phase"))
+DimPlot(yu.list$Yu2021_LW61, group.by = c("Day", "Phase"))
+
+# save normalized, clustered datasets
+saveRDS(yu.list, "../Data/Yu2021/Yu2021_list_filtered_pp.rds")
+```

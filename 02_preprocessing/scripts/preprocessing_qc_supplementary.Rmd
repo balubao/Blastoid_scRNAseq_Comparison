@@ -1,0 +1,452 @@
+---
+title: "preprocessing_qc_supplementary"
+author: "Ali Balubaid"
+date: "2024-02-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# set-up
+
+# renv::deactivate()
+setwd('/home/balubao/Documents/Research/blastoid_comparison/')
+source("script/Initiation.R", verbose = FALSE)
+
+require(gridExtra)
+require(grid)
+require(lattice)
+```
+
+# Supplementary file
+
+To ensure data quality for downstream processing, we 
+1. map reads to a shared reference using as similar pipelines as possible.
+2. follow a shared QC approach to filter cells.
+3. Normalize with the same principles.
+
+To expand on our dataset QC, we show the relevant QC plots and the set thresholds based on each.
+
+1. Petropoulos2016_ref
+```{r petropoulos2016_ref qc}
+Petropoulos.seurat = readRDS('/home/balubao/Documents/Research/Data/Petropoulos2016/Petropoulos2016_raw_kallisto.rds')
+Petropoulos.seurat$sample = "Petropoulos2016_ref"
+
+DefaultAssay(Petropoulos.seurat) = "RNA"
+Petropoulos.seurat = GenerateQCMetrics_v2(Petropoulos.seurat, assay = "RNA")
+PlotQCMetrics(Petropoulos.seurat@meta.data, nFeature_thresh = 7.5e3, nCount_thresh = 2e5, assay = "RNA")  + 
+  plot_annotation(
+    title = 'Petropoulos2016_ref Before Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+# for (i in seq_along(plts)) {
+#   print(plts[[i]])
+# }
+# subset(Petropoulos.seurat, subset = nFeature_RNA > 2e4)
+Petropoulos2016_ref_thresh = data.frame(nFeature_RNA = 7.5e3, nCount_RNA = NA, mitoRatio = 0.2)
+Petropoulos.seurat = subset(Petropoulos.seurat, subset = 
+                              (nFeature_RNA > Petropoulos2016_ref_thresh$nFeature_RNA) &
+                              # (nCount_RNA > Petropoulos2016_ref_thresh$nCount_RNA) &
+                              (mitoRatio < Petropoulos2016_ref_thresh$mitoRatio))
+
+PlotQCMetrics(Petropoulos.seurat@meta.data, nFeature_thresh = 7.5e3, nCount_thresh = 2e5) + 
+  plot_annotation(
+    title = 'Petropoulos2016_ref After Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+saveRDS(Petropoulos.seurat, '/home/balubao/Documents/Research/Data/Petropoulos2016/Petropoulos2016_filtered.rds')
+
+```
+
+
+2. Xiang2020_ref
+```{r xiang2020_ref qc}
+Xiang.seurat = readRDS('/home/balubao/Documents/Research/Data/Xiang2020/Xiang2020_raw_kallisto.rds')
+Xiang.seurat$sample = "Xiang2020_ref"
+Xiang.seurat = GenerateQCMetrics_v2(Xiang.seurat, assay = "RNA")
+
+PlotQCMetrics(Xiang.seurat@meta.data, nFeature_thresh = 9e3, nCount_thresh = 7e6, assay = "RNA") +
+  plot_annotation(
+    title = 'Xiang2020_ref Before Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+# subset(Xiang.seurat, subset = nFeature_RNA > 2e4)
+
+
+Xiang2020_ref_thresh = data.frame(nFeature_RNA = 9e3, nCount_RNA = NA, mitoRatio = 0.2)
+Xiang.seurat = subset(Xiang.seurat, subset =
+                              (nFeature_RNA > Xiang2020_ref_thresh$nFeature_RNA) &
+                              # (nCount_RNA > Xiang2020_ref_thresh$nCount_RNA) &
+                              (mitoRatio < Xiang2020_ref_thresh$mitoRatio))
+
+PlotQCMetrics(Xiang.seurat@meta.data, nFeature_thresh = 9e3, nCount_thresh = 7e6) + 
+  plot_annotation(
+    title = 'Xiang2020_ref After Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+saveRDS(Xiang.seurat, '/home/balubao/Documents/Research/Data/Xiang2020/Xiang2020_filtered.rds')
+```
+
+3. Yanagida2021_ref
+```{r yanagida2021_ref qc}
+Yanagida.seurat = readRDS('/home/balubao/Documents/Research/Data/Yanagida2021/Yanagida2021_raw_kallisto.rds')
+
+## Break into respective groups
+Yanagida_nat.seurat = subset(Yanagida.seurat, Day %in% c("Day7","Day6","Day5"))
+Yanagida_nat.seurat$sample = "Yanagida2021_ref"
+
+DefaultAssay(Yanagida_nat.seurat) = "RNA"
+Yanagida_nat.seurat = GenerateQCMetrics_v2(Yanagida_nat.seurat)
+
+PlotQCMetrics(Yanagida_nat.seurat@meta.data, nFeature_thresh = 9e3, nCount_thresh = 2e6, mitoRatio=0.4)+ 
+  plot_annotation(
+    title = 'Yanagida2021_ref Before Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+# subset(Yanagida_nat.seurat, subset = nFeature_RNA > 2e4)
+
+# & (nFeature_RNA > 1.05e4)
+Yanagida2021_ref_thresh = data.frame(nFeature_RNA = 9e3, nCount_RNA = NA, mitoRatio = 0.3)
+Yanagida_nat.seurat = subset(Yanagida_nat.seurat, subset = (nFeature_RNA > Yanagida2021_ref_thresh$nFeature_RNA) & 
+                               # (nCount_RNA > Yanagida2021_ref_thresh$nCount_RNA) & 
+                               (mitoRatio < Yanagida2021_ref_thresh$mitoRatio))
+
+PlotQCMetrics(Yanagida_nat.seurat@meta.data, nFeature_thresh = 9e3, nCount_thresh = 2e6)+ 
+  plot_annotation(
+    title = 'Yanagida2021_ref After Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+saveRDS(Yanagida_nat.seurat, '/home/balubao/Documents/Research/Data/Yanagida2021/Yanagida2021_ref_filtered.rds')
+```
+While there still remains a notable population with lower counts, we do not over filter to accommodate for the possibility of a different population of cells with different sizes.
+
+4. Yanagida2021
+```{r yanagida2021 qc}
+Yanagida.seurat = readRDS('/home/balubao/Documents/Research/Data/Yanagida2021/Yanagida2021_raw_kallisto.rds')
+
+## Break into respective groups
+Yanagida.seurat = subset(Yanagida.seurat, Day %in% c("Gata3_Day3","Gata3_Day4"))
+Yanagida.seurat$sample = "Yanagida2021"
+
+DefaultAssay(Yanagida.seurat) = "RNA"
+Yanagida.seurat = GenerateQCMetrics_v2(Yanagida.seurat)
+PlotQCMetrics(Yanagida.seurat@meta.data, nFeature_thresh = 9.5e3, nCount_thresh = 2e6) + 
+  plot_annotation(
+    title = 'Yanagida2021 Before Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+# subset(Yanagida.seurat, subset = nFeature_RNA > 2e4)
+
+# & (nFeature_RNA > 1.05e4)
+Yanagida2021_thresh = data.frame(nFeature_RNA = 9.5e3, nCount_RNA = NA, mitoRatio = 0.2)
+Yanagida.seurat = subset(Yanagida.seurat, subset = 
+                           (nFeature_RNA > Yanagida2021_thresh$nFeature_RNA) &
+                           # (nCount_RNA > Yanagida2021_thresh$nCount_RNA) & 
+                           (mitoRatio < Yanagida2021_thresh$mitoRatio))
+
+PlotQCMetrics(Yanagida.seurat@meta.data, nFeature_thresh = 9.5e3, nCount_thresh = 2e6)+ 
+  plot_annotation(
+    title = 'Yanagida2021 After Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+
+saveRDS(Yanagida.seurat, '/home/balubao/Documents/Research/Data/Yanagida2021/Yanagida2021_filtered.rds')
+```
+
+4. Kagawa2022
+```{r kagawa2022 qc}
+Kagawa.seurat = readRDS('/home/balubao/Documents/Research/Data/Kagawa2022/Kagawa2022_raw_kallisto.rds')
+Kagawa.seurat$sample = "Kagawa2022"
+
+DefaultAssay(Kagawa.seurat) = "RNA"
+Kagawa.seurat = GenerateQCMetrics_v2(Kagawa.seurat)
+
+PlotQCMetrics(Kagawa.seurat@meta.data, nFeature_thresh = 4e3, nCount_thresh = 1e5)+ 
+  plot_annotation(
+    title = 'Kagawa2022 Before Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+Kagawa2022_thresh = data.frame(nFeature_RNA = 4e3, nCount_RNA = NA, mitoRatio = 0.2)
+Kagawa.seurat = subset(Kagawa.seurat, subset = (nFeature_RNA > Kagawa2022_thresh$nFeature_RNA) & 
+                         # (nCount_RNA > Kagawa2022_thresh$nCount_RNA) & 
+                         (mitoRatio < Kagawa2022_thresh$mitoRatio))
+
+PlotQCMetrics(Kagawa.seurat@meta.data, nFeature_thresh = 4e3, nCount_thresh = 1e5)+ 
+  plot_annotation(
+    title = 'Kagawa2022 After Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+saveRDS(Kagawa.seurat, '/home/balubao/Documents/Research/Data/Kagawa2022/Kagawa2022_filtered.rds')
+```
+
+5. Fan2021
+```{r fan2021 qc}
+## Load data
+# fan.list = readRDS("../Data/Fan2021/Fan2021_list.rds")
+# 
+# fan.list = lapply(fan.list, GenerateQCMetrics)
+# fan.list = lapply(fan.list, function(x){
+#   x = RenameCells(x, paste0(unique(x$sample),'_',colnames(x)))
+#   return(x)})
+# tmp = lapply(fan.list, function(x){
+#   tmp=x@meta.data
+#   return(tmp)})
+# tmp = rbindlist(tmp, fill = T)
+
+# Fan.seurat = fan.list[[1]]
+Fan.seurat = readRDS("../Data/Fan2021/Fan2021_raw.rds")
+
+Fan.seurat = GenerateQCMetrics(Fan.seurat)
+PlotQCMetrics(Fan.seurat@meta.data,
+              nCount_thresh = 8e3,
+              nFeature_thresh = 3e3,
+              mitoRatio_thresh = 0.2,
+              riboRatio_thresh = NULL,
+              log10FeatPerCount_thresh = 0.8, assay="RNA")+ 
+  plot_annotation(
+    title = 'Fan2021 Before Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+Fan2021_thresh = data.frame(nFeature_RNA = 3e3, nCount_RNA = 8e3, mitoRatio = 0.1)
+Fan.seurat = subset(Fan.seurat, (mitoRatio < Fan2021_thresh$mitoRatio) &
+                      (nFeature_RNA > Fan2021_thresh$nFeature_RNA) & 
+                      (nCount_RNA > Fan2021_thresh$nCount_RNA))
+
+PlotQCMetrics(Fan.seurat@meta.data,
+              nCount_thresh = 8e3,
+              nFeature_thresh = 3e3,
+              mitoRatio_thresh = 0.10,
+              riboRatio_thresh = NULL,
+              log10FeatPerCount_thresh = 0.8, assay="RNA")+ 
+  plot_annotation(
+    title = 'Fan2021 After Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+saveRDS(Fan.seurat, '/home/balubao/Documents/Research/Data/Fan2021/Fan2021_filtered.rds')
+```
+
+6. Lui2021
+```{r lui2021 qc}
+Lui.seurat = readRDS("../Data/Liu2021/Lui2021_raw.rds")
+Lui.seurat$sample = "Lui2021"
+# for(i in seq_along(liu.list)){
+#   liu.list[[i]]$source = 'Liu2021'}
+
+# liu.list = lapply(liu.list, GenerateQCMetrics)
+# liu.list = lapply(liu.list, function(x){
+#   x = RenameCells(x, paste0(unique(x$sample),'_',colnames(x)))
+#   return(x)})
+# tmp = lapply(liu.list, function(x){
+#   tmp=x@meta.data
+#   return(tmp)})
+# # tmp = do.call('rbind', tmp)
+# tmp = as.data.frame(rbindlist(tmp, fill = T))
+# 
+# Lui.seurat = liu.list[[1]]
+
+# RecreateSeuratObject
+Lui.seurat = GenerateQCMetrics(Lui.seurat)
+PlotQCMetrics(Lui.seurat@meta.data,
+              nCount_thresh = 3e3, #mad_thresh(tmp$nCount_RNA, direction = 'lower'),
+              nFeature_thresh = 1e3, #mad_thresh(tmp$nFeature_RNA, direction = 'lower'),
+              mitoRatio_thresh = 0.2,
+              riboRatio_thresh = NULL,
+              log10FeatPerCount_thresh = 0.8, assay="RNA")+ 
+  plot_annotation(
+    title = 'Liu2021 Before Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+Lui2021_thresh = data.frame(nFeature_RNA = 1e3, nCount_RNA = 3e3, mitoRatio = 0.2)
+Lui.seurat = subset(Lui.seurat, (mitoRatio < Lui2021_thresh$mitoRatio) & 
+                      (nFeature_RNA > Lui2021_thresh$nFeature_RNA) & 
+                      (nCount_RNA > Lui2021_thresh$nCount_RNA))
+
+PlotQCMetrics(Lui.seurat@meta.data,
+              nCount_thresh = 3e3, #mad_thresh(tmp$nCount_RNA, direction = 'lower'),
+              nFeature_thresh = 1e3, #mad_thresh(tmp$nFeature_RNA, direction = 'lower'),
+              mitoRatio_thresh = 0.2,
+              riboRatio_thresh = NULL,
+              log10FeatPerCount_thresh = 0.8, assay="RNA")+ 
+  plot_annotation(
+    title = 'Liu2021 After Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+saveRDS(Lui.seurat, '/home/balubao/Documents/Research/Data/Liu2021/Liu2021_filtered.rds')
+```
+
+7. Yu2021
+```{r yu2021 qc}
+#load data
+# yu.list = readRDS("../Data/Yu2021/Yu2021_list.rds")
+# names(yu.list) = sapply(yu.list, function(x) unique(x$sample))
+# for(i in seq_along(yu.list)){
+#   # yu.list[[i]]$sample = paste0('Yu2021_',names(yu.list)[i])
+#   yu.list[[i]]$source = 'Yu2021'}
+# 
+# names(yu.list) = sapply(yu.list, function(x) unique(x$sample))
+
+# yu.list = lapply(yu.list, function(x){
+#   x = RenameCells(x, paste0(unique(x$sample),'_',colnames(x)))
+#   return(x)})
+#tmp = rbindlist(tmp, fill = T, use.names = T)
+
+Yu60.seurat = readRDS("../Data/Yu2021/Yu2021_LW60_raw.rds")
+Yu60.seurat$sample = "Yu2021_LW60"
+Yu61.seurat = readRDS("../Data/Yu2021/Yu2021_LW61_raw.rds")
+Yu61.seurat$sample = "Yu2021_LW61"
+
+yu.list = list(Yu60.seurat, Yu61.seurat)
+yu.list = lapply(yu.list, GenerateQCMetrics)
+tmp = lapply(yu.list, function(x){
+  tmp=x@meta.data
+  return(tmp)})
+tmp = as.data.frame(rbindlist(tmp, fill = T))
+
+PlotQCMetrics(tmp,
+              nCount_thresh = 7e3,
+              nFeature_thresh = 1e3, 
+              mitoRatio_thresh = 0.2,
+              riboRatio_thresh = NULL,
+              log10FeatPerCount_thresh = 0.8, assay="RNA")+ 
+  plot_annotation(
+    title = 'Yu2021 Before Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+Yu2021_thresh = data.frame(nFeature_RNA = 1e3, nCount_RNA = 7e3, mitoRatio = 0.2)
+yu.list = lapply(yu.list, function(x){subset(x, (mitoRatio < Yu2021_thresh$mitoRatio) & 
+                                               (nFeature_RNA > Yu2021_thresh$nFeature_RNA) & 
+                                               (nCount_RNA > Yu2021_thresh$nCount_RNA))})
+
+tmp = lapply(yu.list, function(x){
+  tmp=x@meta.data
+  return(tmp)})
+tmp = as.data.frame(rbindlist(tmp, fill = T))
+#tmp = rbindlist(tmp, fill = T, use.names = T)
+
+PlotQCMetrics(tmp,
+              nCount_thresh = 7e3,
+              nFeature_thresh = 1e3, 
+              mitoRatio_thresh = 0.2,
+              riboRatio_thresh = NULL,
+              log10FeatPerCount_thresh = 0.8, assay="RNA")+ 
+  plot_annotation(
+    title = 'Yu2021 After Filtering',
+    subtitle = element_blank(),
+    caption = element_blank()
+  )
+
+
+saveRDS(yu.list, "../Data/Yu2021/Yu2021_filtered_list.rds")
+
+```
+
+8. Sozen2021
+```{r sozen2021 qc}
+#load data
+sozen.list = readRDS("../Data/Sozen2021/Sozen2021_list.rds")
+
+sozen.list = lapply(sozen.list, GenerateQCMetrics)
+sozen.list = lapply(sozen.list, function(x){
+  x = RenameCells(x, paste0(unique(x$sample),'_',colnames(x)))
+  return(x)})
+Sozen.seurat = sozen.list[[1]]
+# tmp = lapply(sozen.list, function(x){
+  # tmp=x@meta.data
+  # return(tmp)})
+
+Sozen.seurat$orig.ident = "Sozen2021"
+Sozen.seurat$sample = "Sozen2021"
+# "hEPSCs/D5_hEP-structures/D6_hEP-structures_multiplexed_samples"
+
+## QC
+# revise GenerateQC to include Assay + slot
+PlotQCMetrics(Sozen.seurat@meta.data, assay="RNA",
+              nCount_thresh  = 2e3,
+              nFeature_thresh = 1e3, 
+              mitoRatio_thresh = 0.2)
+
+Sozen2021_thresh = data.frame(nFeature_RNA = 1e3, nCount_RNA = 2e3, mitoRatio = 0.2)
+Sozen.seurat = subset(Sozen.seurat, (nFeature_RNA > Sozen2021_thresh$nFeature_RNA) &
+                        (nCount_RNA > Sozen2021_thresh$nCount_RNA) &
+                        (mitoRatio < Sozen2021_thresh$mitoRatio))
+
+PlotQCMetrics(Sozen.seurat@meta.data, assay="RNA",
+              nCount_thresh  = 2e3,
+              nFeature_thresh = 1e3, 
+              mitoRatio_thresh = 0.2)
+
+saveRDS(Sozen.seurat, '/home/balubao/Documents/Research/Data/Sozen2021/Sozen2021_filtered.rds')
+```
+
+# Filtering Thresholds
+We use density plot inflections to set our thresholds. this is similar to cellranger's knee inflection point as empty droplet cut off. Additionally, we cut off notable tails in the density plots. Using these guiding principles in aid with the QC plots presented, we generate data set specific thresholds. This is generally the case for thresholding the number of counts and number of features for the cells. For the mitochodrial read ratio, we filter at 20% unless there was reasonable doubt given the observed density plot. We provide all thresholds in a summary table below.
+
+```{r}
+thresholds_per_data_ls = list(Petropoulos2016_ref = Petropoulos2016_ref_thresh,
+                              Xiang2020_re = Xiang2020_ref_thresh,
+                              Yanagida2021_ref = Yanagida2021_ref_thresh,
+                              Yanagida2021 = Yanagida2021_thresh,
+                              Kagawa2022 = Kagawa2022_thresh,
+                              Yu2021 = Yu2021_thresh,
+                              Lui2021 = Lui2021_thresh,
+                              Fan2021 = Fan2021_thresh,
+                              Sozen2021 = Sozen2021_thresh)
+
+thresholds_per_data = rbindlist(thresholds_per_data_ls, fill = TRUE, use.names = TRUE, idcol = TRUE)
+write.table(thresholds_per_data, file = "02_preprocessing/filtering_thresholds_table.csv", row.names = TRUE, col.names = TRUE, sep = ",")
+
+```
+
+Consequently, the total cells and features remaining post-QC are the following:
+```{r}
+dim_df = sapply(seurat.list, dim)
+rownames(dim_df) = c("NGenes", "NCells")
+write.table(dim_df, file = "02_preprocessing/ncells_ngenes_postqc_table.csv", row.names = TRUE, col.names = TRUE, sep = ",")
+
+```
+
+
+```{r}
+
+old_table = knitr::kable(thresholds_per_data) 
+old_table
+```
+
+
+
+
+
+
+
