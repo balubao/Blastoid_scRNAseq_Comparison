@@ -28,7 +28,6 @@ The analysis was conducted through the following steps:
 - `scripts/`: Contains all analysis scripts.
 - `data/`: Placeholder for input data files (not included due to size and privacy restrictions).
 - `results/`: Contains processed data, figures, and other output files.
-- `docs/`: Documentation and additional resources for reproducing the analysis.
 
 ## Dependencies
 This analysis was performed using the following tools and libraries:
